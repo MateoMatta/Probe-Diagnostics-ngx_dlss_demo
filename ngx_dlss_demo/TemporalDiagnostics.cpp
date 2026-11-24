@@ -708,6 +708,107 @@ void verify_taa_gpu_pipeline(nvrhi::IDevice* device)
     }
 }
 
+void verify_late_addon_resource(nvrhi::IDevice* device)
+{
+    auto& log = logger();
+    if (log.frame != 120)
+        return;
+    wchar_t path[32768] {};
+    const DWORD size = GetEnvironmentVariableW(L"OPTISCALER_DEMO_LATE_ADDON_PATH", path, _countof(path));
+    if (size == 0 && GetLastError() == ERROR_ENVVAR_NOT_FOUND)
+        return;
+    if (size == 0 || size >= _countof(path))
+    {
+        log.write("event=late_addon_error stage=path");
+        return;
+    }
+    ID3D11DeviceContext* context = device->getNativeObject(nvrhi::ObjectTypes::D3D11_DeviceContext);
+    if (!context || context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE)
+    {
+        log.write("event=late_addon_error stage=context");
+        return;
+    }
+    ComPtr<ID3D11Device> nativeDevice;
+    context->GetDevice(&nativeDevice);
+    D3D11_TEXTURE2D_DESC desc {};
+    desc.Width = 32; desc.Height = 32; desc.MipLevels = 1; desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT; desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+    ComPtr<ID3D11Texture2D> texture;
+    HRESULT hr = nativeDevice->CreateTexture2D(&desc, nullptr, &texture);
+    if (FAILED(hr))
+    {
+        log.write("event=late_addon_error stage=create_texture hr=0x%08X", static_cast<unsigned>(hr));
+        return;
+    }
+    ComPtr<ID3D11RenderTargetView> view;
+    hr = nativeDevice->CreateRenderTargetView(texture.Get(), nullptr, &view);
+    if (FAILED(hr))
+    {
+        log.write("event=late_addon_error stage=create_view hr=0x%08X", static_cast<unsigned>(hr));
+        return;
+    }
+    log.write("event=late_addon_texture_created resource=%p", static_cast<void*>(texture.Get()));
+    HMODULE reshadeModule = GetModuleHandleW(L"dxgi.dll");
+    HMODULE addon = LoadLibraryW(path);
+    if (!reshadeModule || !addon)
+    {
+        log.write("event=late_addon_error stage=load error=%lu", GetLastError());
+        if (addon) FreeLibrary(addon);
+        return;
+    }
+    using Init = bool (*)(HMODULE, HMODULE);
+    using Uninit = void (*)(HMODULE, HMODULE);
+    const auto init = reinterpret_cast<Init>(GetProcAddress(addon, "AddonInit"));
+    const auto uninit = reinterpret_cast<Uninit>(GetProcAddress(addon, "AddonUninit"));
+    auto* name = reinterpret_cast<const char**>(GetProcAddress(addon, "NAME"));
+    if (!init || !uninit || !name)
+    {
+        log.write("event=late_addon_error stage=missing_exports");
+        FreeLibrary(addon);
+        return;
+    }
+    *name = "OptiScaler Late Registration Diagnostic";
+    if (!init(addon, reshadeModule))
+    {
+        log.write("event=late_addon_error stage=registration");
+        FreeLibrary(addon);
+        return;
+    }
+    log.write("event=late_addon_registered resource=%p", static_cast<void*>(texture.Get()));
+    ComPtr<ID3D11Texture2D> control;
+    ComPtr<ID3D11RenderTargetView> controlView;
+    hr = nativeDevice->CreateTexture2D(&desc, nullptr, &control);
+    if (SUCCEEDED(hr))
+        hr = nativeDevice->CreateRenderTargetView(control.Get(), nullptr, &controlView);
+    if (FAILED(hr))
+    {
+        log.write("event=late_addon_error stage=control_create hr=0x%08X", static_cast<unsigned>(hr));
+        uninit(addon, reshadeModule);
+        FreeLibrary(addon);
+        return;
+    }
+    log.write("event=late_addon_control_created resource=%p", static_cast<void*>(control.Get()));
+    ComPtr<ID3D11RenderTargetView> previous[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
+    ID3D11RenderTargetView* saved[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] {};
+    ComPtr<ID3D11DepthStencilView> depth;
+    context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, saved, &depth);
+    for (unsigned i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i)
+        previous[i].Attach(saved[i]);
+    ID3D11RenderTargetView* target = view.Get();
+    context->OMSetRenderTargets(1, &target, nullptr);
+    log.write("event=late_addon_bound resource=%p", static_cast<void*>(texture.Get()));
+    target = controlView.Get();
+    context->OMSetRenderTargets(1, &target, nullptr);
+    log.write("event=late_addon_control_bound resource=%p", static_cast<void*>(control.Get()));
+    context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, saved, depth.Get());
+    controlView.Reset();
+    control.Reset();
+    uninit(addon, reshadeModule);
+    FreeLibrary(addon);
+    log.write("event=late_addon_result status=complete");
+}
+
 void verify_multiple_swapchains(nvrhi::IDevice* device)
 {
     auto& log = logger();

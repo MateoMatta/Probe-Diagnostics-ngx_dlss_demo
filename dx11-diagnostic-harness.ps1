@@ -12,6 +12,7 @@ param(
     [switch]$CameraOnly,
     [switch]$ResizeDlssOnly,
     [switch]$MultiSwapOnly,
+    [switch]$LateAddonOnly,
     [switch]$StressFps
 )
 
@@ -37,7 +38,8 @@ $environmentNames = @('OPTISCALER_DEMO_TRACE', 'OPTISCALER_DEMO_READBACK',
     'OPTISCALER_PROBE_DETAIL_START', 'OPTISCALER_PROBE_ALL_TARGET_BINDINGS',
     'OPTISCALER_PROBE_SHADER_BINDINGS', 'OPTISCALER_DEMO_GPU_SYNC_TEST',
     'OPTISCALER_DEMO_IDENTITY_SELFTEST', 'OPTISCALER_PROBE_RESOURCE_LIFETIMES',
-    'OPTISCALER_DEMO_GPU_PIPELINE_TEST', 'OPTISCALER_DEMO_MULTISWAP_TEST', 'DONUT_MEDIA_PATH')
+    'OPTISCALER_DEMO_GPU_PIPELINE_TEST', 'OPTISCALER_DEMO_MULTISWAP_TEST',
+    'OPTISCALER_DEMO_LATE_ADDON_PATH', 'DONUT_MEDIA_PATH')
 $previousEnvironment = @{}
 foreach ($name in $environmentNames) {
     $previousEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
@@ -57,11 +59,12 @@ $cases = @(
     @{ Name = 'resource-resize-dlss'; Args = '-aamode dlss -diagnostic-resize'; Readback = $false },
     @{ Name = 'gpu-pipeline'; Args = '-aamode temporal'; Readback = $false },
     @{ Name = 'multi-swapchain'; Args = '-aamode temporal'; Readback = $false },
+    @{ Name = 'late-addon-resource'; Args = '-aamode temporal'; Readback = $false },
     @{ Name = 'frame-correlation'; Args = '-aamode dlss'; Readback = $false },
     @{ Name = 'all-target-bindings'; Args = '-aamode dlss'; Readback = $false },
     @{ Name = 'shader-bindings'; Args = '-aamode temporal'; Readback = $false }
 )
-if (@($ShaderBindingsOnly, $OverlapOnly, $IdentityOnly, $DxgiAdapterOnly, $ResizeOnly, $ResizeDlssOnly, $GpuPipelineOnly, $CameraOnly, $MultiSwapOnly | Where-Object { $_ }).Count -gt 1) {
+if (@($ShaderBindingsOnly, $OverlapOnly, $IdentityOnly, $DxgiAdapterOnly, $ResizeOnly, $ResizeDlssOnly, $GpuPipelineOnly, $CameraOnly, $MultiSwapOnly, $LateAddonOnly | Where-Object { $_ }).Count -gt 1) {
     throw 'Select only one targeted harness mode'
 }
 if ($ShaderBindingsOnly) {
@@ -87,6 +90,9 @@ if ($GpuPipelineOnly) {
 }
 if ($MultiSwapOnly) {
     $cases = @($cases | Where-Object { $_.Name -eq 'multi-swapchain' })
+}
+if ($LateAddonOnly) {
+    $cases = @($cases | Where-Object { $_.Name -eq 'late-addon-resource' })
 }
 if ($CameraOnly) {
     $cases = @($cases | Where-Object { $_.Name -eq 'camera-temporal' })
@@ -115,7 +121,7 @@ try {
         if ($case.Name -eq 'identity-selftest') { $identity = '1' }
         [Environment]::SetEnvironmentVariable('OPTISCALER_DEMO_IDENTITY_SELFTEST', $identity, 'Process')
         $lifetimes = $null
-        if ($case.Name -in @('resource-resize', 'resource-resize-dlss', 'multi-swapchain')) { $lifetimes = '1' }
+        if ($case.Name -in @('resource-resize', 'resource-resize-dlss', 'multi-swapchain', 'late-addon-resource')) { $lifetimes = '1' }
         [Environment]::SetEnvironmentVariable('OPTISCALER_PROBE_RESOURCE_LIFETIMES', $lifetimes, 'Process')
         $pipeline = $null
         if ($case.Name -eq 'gpu-pipeline') { $pipeline = '1' }
@@ -125,6 +131,16 @@ try {
         [Environment]::SetEnvironmentVariable('OPTISCALER_DEMO_MULTISWAP_TEST', $multiSwap, 'Process')
         $caseDirectory = Join-Path $output $case.Name
         New-Item -ItemType Directory -Path $caseDirectory | Out-Null
+        $lateAddonPath = $null
+        if ($case.Name -eq 'late-addon-resource') {
+            $lateDirectory = Join-Path $caseDirectory 'late-addon'
+            New-Item -ItemType Directory -Path $lateDirectory | Out-Null
+            foreach ($file in @('OptiScaler.addon64', 'OptiScaler.ini')) {
+                Copy-Item -LiteralPath (Join-Path $workingDirectory $file) -Destination $lateDirectory
+            }
+            $lateAddonPath = Join-Path $lateDirectory 'OptiScaler.addon64'
+        }
+        [Environment]::SetEnvironmentVariable('OPTISCALER_DEMO_LATE_ADDON_PATH', $lateAddonPath, 'Process')
         $existingLogs = @{}
         foreach ($pattern in @('TemporalInputs_*.log', 'OptiScaler-ReShade_*.log')) {
             Get-ChildItem -LiteralPath $workingDirectory -Filter $pattern | ForEach-Object {
@@ -383,10 +399,55 @@ try {
             throw "$($case.Name): missing clean logger shutdown"
         }
         if (@($trace | Where-Object {
-            $_ -match 'event=(readback_error|stencil_clear_error|taa_binding_error|gpu_sync_error|temporal_parameter_error|multiswap_error)\b' -or
+            $_ -match 'event=(readback_error|stencil_clear_error|taa_binding_error|gpu_sync_error|temporal_parameter_error|multiswap_error|late_addon_error)\b' -or
             $_ -match 'event=resource_contract(?:_selftest)?\b.*\bstatus=error\b'
         }).Count) {
             throw "$($case.Name): diagnostic error; inspect archived trace"
+        }
+        if ($case.Name -eq 'late-addon-resource') {
+            $created = @($trace | Where-Object { $_ -match 'event=late_addon_texture_created resource=([0-9A-Fa-f]+)' })
+            $registered = @($trace | Where-Object { $_ -match 'event=late_addon_registered resource=' })
+            $bound = @($trace | Where-Object { $_ -match 'event=late_addon_bound resource=' })
+            if ($created.Count -ne 1 -or $registered.Count -ne 1 -or $bound.Count -ne 1 -or
+                $created[0] -notmatch '\bqpc=(\d+).*resource=([0-9A-Fa-f]+)') {
+                throw "$($case.Name): missing late registration markers"
+            }
+            $creationQpc = [long]$Matches[1]; $resource = $Matches[2].TrimStart('0')
+            if ($registered[0] -notmatch "\bqpc=(\d+).*resource=0*$resource\b" -or [long]$Matches[1] -le $creationQpc) {
+                throw "$($case.Name): registration did not follow resource creation"
+            }
+            $registrationQpc = [long]$Matches[1]
+            if ($bound[0] -notmatch "\bqpc=(\d+).*resource=0*$resource\b" -or [long]$Matches[1] -le $registrationQpc) {
+                throw "$($case.Name): binding did not follow registration"
+            }
+            $lateLogs = @(Get-ChildItem -LiteralPath $lateDirectory -Filter 'OptiScaler-ReShade_*.log')
+            if ($lateLogs.Count -ne 1) { throw "$($case.Name): expected one late add-on log, got $($lateLogs.Count)" }
+            $lateLog = Get-Content -LiteralPath $lateLogs[0].FullName
+            if (@($lateLog | Where-Object { $_ -match "event=resource_lifetime action=create\b.*resource=0x0*$resource\b" }).Count -ne 0 -or
+                @($lateLog | Where-Object { $_ -match "event=resource_lifetime action=observe\b.*resource=0x0*$resource\b.*generation=0 status=unknown\b" }).Count -ne 1 -or
+                @($lateLog | Where-Object { $_ -match 'event=addon_registered\b' }).Count -ne 1 -or
+                @($trace | Where-Object { $_ -match 'event=late_addon_result status=complete\b' }).Count -ne 1 -or
+                @($lateLog | Where-Object { $_ -match 'event=logger_shutdown dropped=0 file_write_failed=0 .*truncated=0' }).Count -ne 1) {
+                throw "$($case.Name): pre-registration resource was not observed as unknown with clean logging"
+            }
+            if (@($addon | Where-Object { $_ -match "event=resource_lifetime action=create\b.*resource=0x0*$resource\b generation=[1-9]\d*\b" }).Count -ne 1) {
+                throw "$($case.Name): primary add-on did not observe pre-registration resource creation"
+            }
+            $controlCreated = @($trace | Where-Object { $_ -match 'event=late_addon_control_created resource=' })
+            if ($controlCreated.Count -ne 1 -or $controlCreated[0] -notmatch '\bqpc=(\d+).*resource=([0-9A-Fa-f]+)' -or
+                [long]$Matches[1] -le $registrationQpc) {
+                throw "$($case.Name): missing post-registration control"
+            }
+            $control = $Matches[2].TrimStart('0')
+            $controlCreate = @($lateLog | Where-Object { $_ -match "event=resource_lifetime action=create\b.*resource=0x0*$control\b" })
+            if ($controlCreate.Count -ne 1 -or $controlCreate[0] -notmatch '\bgeneration=([1-9]\d*)\b') {
+                throw "$($case.Name): control creation generation missing"
+            }
+            $generation = $Matches[1]
+            if (@($lateLog | Where-Object { $_ -match "event=resource_lifetime action=observe\b.*resource=0x0*$control\b generation=$generation status=live\b" }).Count -ne 1) {
+                throw "$($case.Name): post-registration control was not observed live"
+            }
+            Write-Output 'LATE_ADDON pre_registration=unknown post_registration=live'
         }
         if ($case.Name -eq 'multi-swapchain') {
             $created = @($trace | Where-Object { $_ -match 'event=multiswap_created index=[01] chain=' })

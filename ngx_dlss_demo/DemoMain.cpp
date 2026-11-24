@@ -1380,6 +1380,7 @@ public:
                     temporal_diagnostics::verify_taa_gpu_completion(GetDevice());
                     temporal_diagnostics::verify_taa_gpu_pipeline(GetDevice());
                     temporal_diagnostics::verify_multiple_swapchains(GetDevice());
+                    temporal_diagnostics::verify_late_addon_resource(GetDevice());
                 }
 #endif
             }
