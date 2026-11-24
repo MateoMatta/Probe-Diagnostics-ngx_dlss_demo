@@ -1775,6 +1775,14 @@ void verify_combined_diagnostics(nvrhi::IDevice* device, nvrhi::ITexture* source
         valid = valid && std::fabs(stats.x[i] - 0.75f) < 0.000001f && stats.stencil[i] == 73;
     log.write("event=combined_depth format=d24s8 views=dsv,srv depth=0.75 stencil=73 samples=%u status=%s",
               stats.count, valid ? "pass" : "error");
+    context->ClearDepthStencilView(dsv.Get(), D3D11_CLEAR_STENCIL, 0.f, 19);
+    Stats stencilStats;
+    const bool stencilRead = sample_texture(context, texture.Get(), true, 16, 16, 0, 0, "combined_stencil", stencilStats);
+    valid = stencilRead && stencilStats.count == 256 && stencilStats.nonfinite == 0;
+    for (unsigned i = 0; i < stencilStats.count; ++i)
+        valid = valid && std::fabs(stencilStats.x[i] - 0.75f) < 0.000001f && stencilStats.stencil[i] == 19;
+    log.write("event=combined_stencil depth=0.75 stencil=19 samples=%u status=%s",
+              stencilStats.count, valid ? "pass" : "error");
     desc.Format = DXGI_FORMAT_R32_TYPELESS;
     ComPtr<ID3D11Texture2D> depth32;
     hr = nativeDevice->CreateTexture2D(&desc, nullptr, &depth32);
@@ -1813,6 +1821,62 @@ void verify_combined_diagnostics(nvrhi::IDevice* device, nvrhi::ITexture* source
         }
     context->Unmap(stage32.Get(), 0);
     log.write("event=combined_depth format=d32 views=dsv,srv depth=0.125 samples=256 status=%s", valid ? "pass" : "error");
+
+    desc.Usage = D3D11_USAGE_DEFAULT; desc.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
+    desc.CPUAccessFlags = 0; desc.Format = DXGI_FORMAT_R16_TYPELESS;
+    ComPtr<ID3D11Texture2D> depth16;
+    hr = nativeDevice->CreateTexture2D(&desc, nullptr, &depth16);
+    dsvDesc.Format = DXGI_FORMAT_D16_UNORM;
+    ComPtr<ID3D11DepthStencilView> dsv16;
+    if (SUCCEEDED(hr)) hr = nativeDevice->CreateDepthStencilView(depth16.Get(), &dsvDesc, &dsv16);
+    srvDesc.Format = DXGI_FORMAT_R16_UNORM;
+    ComPtr<ID3D11ShaderResourceView> srv16;
+    if (SUCCEEDED(hr)) hr = nativeDevice->CreateShaderResourceView(depth16.Get(), &srvDesc, &srv16);
+    desc.Usage = D3D11_USAGE_STAGING; desc.BindFlags = 0; desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ComPtr<ID3D11Texture2D> stage16;
+    if (SUCCEEDED(hr)) hr = nativeDevice->CreateTexture2D(&desc, nullptr, &stage16);
+    if (FAILED(hr))
+    {
+        log.write("event=combined_error stage=depth16_setup hr=0x%08X", static_cast<unsigned>(hr));
+        return;
+    }
+    dsvResource.Reset(); srvResource.Reset();
+    dsv16->GetResource(&dsvResource); srv16->GetResource(&srvResource);
+    context->ClearDepthStencilView(dsv16.Get(), D3D11_CLEAR_DEPTH, 0.5f, 0);
+    context->CopyResource(stage16.Get(), depth16.Get());
+    hr = context->Map(stage16.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr))
+    {
+        log.write("event=combined_error stage=depth16_map hr=0x%08X", static_cast<unsigned>(hr));
+        return;
+    }
+    valid = dsvResource.Get() == depth16.Get() && srvResource.Get() == depth16.Get();
+    for (unsigned y = 0; y < 16; ++y)
+        for (unsigned x = 0; x < 16; ++x)
+        {
+            uint16_t value;
+            memcpy(&value, static_cast<const uint8_t*>(mapped.pData) + y * mapped.RowPitch + x * sizeof(value), sizeof(value));
+            valid = valid && (value == 32767 || value == 32768);
+        }
+    context->Unmap(stage16.Get(), 0);
+    log.write("event=combined_depth format=d16 views=dsv,srv depth=0.5 samples=256 status=%s", valid ? "pass" : "error");
+
+    uint8_t values[2][4] {};
+    hr = static_cast<HRESULT>(run_srgb_selftest(nativeDevice.Get(), values));
+    if (FAILED(hr))
+    {
+        log.write("event=combined_error stage=srgb_draw hr=0x%08X", static_cast<unsigned>(hr));
+        return;
+    }
+    valid = true;
+    for (unsigned c = 0; c < 3; ++c)
+        valid = valid && std::abs(static_cast<int>(values[0][c]) - 64) <= 1 &&
+            std::abs(static_cast<int>(values[1][c]) - 137) <= 1;
+    valid = valid && std::abs(static_cast<int>(values[0][3]) - 128) <= 1 &&
+        std::abs(static_cast<int>(values[1][3]) - 128) <= 1;
+    log.write("event=combined_srgb linear=%u,%u,%u,%u srgb=%u,%u,%u,%u status=%s",
+              values[0][0], values[0][1], values[0][2], values[0][3],
+              values[1][0], values[1][1], values[1][2], values[1][3], valid ? "pass" : "error");
 }
 
 void log_dlss_result(unsigned result)

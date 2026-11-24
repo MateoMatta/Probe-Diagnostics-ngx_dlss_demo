@@ -57,6 +57,79 @@ void cs(uint3 thread : SV_DispatchThreadID)
     struct Constants { uint32_t reverse, equal, transparent, padding; };
 }
 
+long run_srgb_selftest(ID3D11Device* sourceDevice, uint8_t values[2][4])
+{
+    if (!sourceDevice || !values) return static_cast<long>(E_POINTER);
+    ComPtr<IDXGIDevice> dxgiDevice;
+    HRESULT hr = sourceDevice->QueryInterface(IID_PPV_ARGS(&dxgiDevice));
+    if (FAILED(hr)) return static_cast<long>(hr);
+    ComPtr<IDXGIAdapter> adapter;
+    hr = dxgiDevice->GetAdapter(&adapter);
+    if (FAILED(hr)) return static_cast<long>(hr);
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
+    const D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_0 };
+    hr = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, levels, 1,
+                           D3D11_SDK_VERSION, &device, nullptr, &context);
+    if (FAILED(hr)) return static_cast<long>(hr);
+    const char shader[] = R"(
+float4 vs(uint id : SV_VertexID) : SV_Position {
+    float2 p[3] = { float2(-1,-1), float2(-1,3), float2(3,-1) };
+    return float4(p[id], 0, 1);
+}
+float4 ps() : SV_Target { return float4(0.25, 0.25, 0.25, 0.5); }
+)";
+    ComPtr<ID3DBlob> vsCode, psCode, errors;
+    hr = D3DCompile(shader, sizeof(shader) - 1, "srgb-selftest", nullptr, nullptr, "vs", "vs_5_0", 0, 0, &vsCode, &errors);
+    if (FAILED(hr)) { if (errors) OutputDebugStringA(static_cast<const char*>(errors->GetBufferPointer())); return static_cast<long>(hr); }
+    errors.Reset();
+    hr = D3DCompile(shader, sizeof(shader) - 1, "srgb-selftest", nullptr, nullptr, "ps", "ps_5_0", 0, 0, &psCode, &errors);
+    if (FAILED(hr)) { if (errors) OutputDebugStringA(static_cast<const char*>(errors->GetBufferPointer())); return static_cast<long>(hr); }
+    ComPtr<ID3D11VertexShader> vs;
+    ComPtr<ID3D11PixelShader> ps;
+    hr = device->CreateVertexShader(vsCode->GetBufferPointer(), vsCode->GetBufferSize(), nullptr, &vs);
+    if (SUCCEEDED(hr)) hr = device->CreatePixelShader(psCode->GetBufferPointer(), psCode->GetBufferSize(), nullptr, &ps);
+    if (FAILED(hr)) return static_cast<long>(hr);
+    D3D11_TEXTURE2D_DESC desc {};
+    desc.Width = 1; desc.Height = 1; desc.MipLevels = 1; desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS; desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT; desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+    ComPtr<ID3D11Texture2D> texture, staging;
+    hr = device->CreateTexture2D(&desc, nullptr, &texture);
+    D3D11_RENDER_TARGET_VIEW_DESC rtvDesc {};
+    rtvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+    ComPtr<ID3D11RenderTargetView> linear, srgb;
+    if (SUCCEEDED(hr)) hr = device->CreateRenderTargetView(texture.Get(), &rtvDesc, &linear);
+    rtvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    if (SUCCEEDED(hr)) hr = device->CreateRenderTargetView(texture.Get(), &rtvDesc, &srgb);
+    desc.Usage = D3D11_USAGE_STAGING; desc.BindFlags = 0; desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (SUCCEEDED(hr)) hr = device->CreateTexture2D(&desc, nullptr, &staging);
+    D3D11_RASTERIZER_DESC rasterDesc {};
+    rasterDesc.FillMode = D3D11_FILL_SOLID; rasterDesc.CullMode = D3D11_CULL_NONE; rasterDesc.DepthClipEnable = TRUE;
+    ComPtr<ID3D11RasterizerState> raster;
+    if (SUCCEEDED(hr)) hr = device->CreateRasterizerState(&rasterDesc, &raster);
+    if (FAILED(hr)) return static_cast<long>(hr);
+    D3D11_VIEWPORT viewport { 0, 0, 1, 1, 0, 1 };
+    context->RSSetState(raster.Get()); context->RSSetViewports(1, &viewport);
+    context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    context->VSSetShader(vs.Get(), nullptr, 0); context->PSSetShader(ps.Get(), nullptr, 0);
+    ID3D11RenderTargetView* views[] = { linear.Get(), srgb.Get() };
+    for (unsigned i = 0; i < 2; ++i)
+    {
+        const float clear[4] = { 0, 0, 0, 0 };
+        context->ClearRenderTargetView(views[i], clear);
+        context->OMSetRenderTargets(1, &views[i], nullptr);
+        context->Draw(3, 0);
+        context->CopyResource(staging.Get(), texture.Get());
+        D3D11_MAPPED_SUBRESOURCE mapped {};
+        hr = context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+        if (FAILED(hr)) return static_cast<long>(hr);
+        memcpy(values[i], mapped.pData, 4);
+        context->Unmap(staging.Get(), 0);
+    }
+    return static_cast<long>(S_OK);
+}
+
 IdentityTestResult run_identity_selftest(ID3D11Device* sourceDevice)
 {
     IdentityTestResult result;

@@ -13,4 +13,5 @@ struct IdentityTestResult
 };
 
 IdentityTestResult run_identity_selftest(ID3D11Device* sourceDevice);
+long run_srgb_selftest(ID3D11Device* sourceDevice, uint8_t values[2][4]);
 #endif

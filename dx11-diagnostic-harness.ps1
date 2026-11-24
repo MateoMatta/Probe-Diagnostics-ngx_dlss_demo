@@ -414,7 +414,7 @@ try {
         }
         if (@($trace | Where-Object {
             $_ -match 'event=(readback_error|color_readback_error|exposure_readback_error|output_test_error|influence_error|combined_error|stencil_clear_error|taa_binding_error|gpu_sync_error|temporal_parameter_error|multiswap_error|late_addon_error)\b' -or
-            $_ -match 'event=(resource_contract(?:_selftest)?|color_selftest|exposure_selftest|output_test_result|output_test_consumer|influence_result|combined_depth|combined_backbuffer)\b.*\bstatus=error\b'
+            $_ -match 'event=(resource_contract(?:_selftest)?|color_selftest|exposure_selftest|output_test_result|output_test_consumer|influence_result|combined_depth|combined_stencil|combined_srgb|combined_backbuffer)\b.*\bstatus=error\b'
         }).Count) {
             throw "$($case.Name): diagnostic error; inspect archived trace"
         }
@@ -511,8 +511,12 @@ try {
             if ($CombinedOnly) {
                 $depth24 = @($trace | Where-Object { $_ -match '\bframe=120 event=combined_depth format=d24s8 views=dsv,srv depth=0.75 stencil=73 samples=256 status=pass\b' })
                 $depth32 = @($trace | Where-Object { $_ -match '\bframe=120 event=combined_depth format=d32 views=dsv,srv depth=0.125 samples=256 status=pass\b' })
+                $depth16 = @($trace | Where-Object { $_ -match '\bframe=120 event=combined_depth format=d16 views=dsv,srv depth=0.5 samples=256 status=pass\b' })
+                $stencil = @($trace | Where-Object { $_ -match '\bframe=120 event=combined_stencil depth=0.75 stencil=19 samples=256 status=pass\b' })
+                $srgb = @($trace | Where-Object { $_ -match '\bframe=120 event=combined_srgb\b.*status=pass\b' })
                 $back = @($trace | Where-Object { $_ -match '\bframe=120 event=combined_backbuffer\b' })
-                if ($depth24.Count -ne 1 -or $depth32.Count -ne 1 -or $back.Count -ne 1 -or
+                if ($depth24.Count -ne 1 -or $depth32.Count -ne 1 -or $depth16.Count -ne 1 -or
+                    $stencil.Count -ne 1 -or $srgb.Count -ne 1 -or $back.Count -ne 1 -or
                     $back[0] -notmatch '\bsource=([0-9A-Fa-f]+) ps_t0=\1 target=([0-9A-Fa-f]+) om_rtv0=\2 size=(\d+)x(\d+) pixels=(\d+) nonblack=(\d+) status=pass\b') {
                     throw "$($case.Name): combined depth or backbuffer test failed"
                 }
@@ -529,7 +533,7 @@ try {
                 }
                 $swap = @($addon | Where-Object { $_ -match "event=back_buffer index=0 resource=0x0*$target\b" })
                 if ($swap.Count -lt 1) { throw "$($case.Name): target was not observed as swapchain backbuffer" }
-                Write-Output "COMBINED depth=d24s8,d32 backbuffer_pixels=$pixels nonblack=$nonblack swapchain=matched"
+                Write-Output "COMBINED depth=d24s8,d32,d16 stencil_preserved=1 srgb=pass backbuffer_pixels=$pixels nonblack=$nonblack swapchain=matched"
             }
         }
         if ($case.Name -eq 'late-addon-resource') {
