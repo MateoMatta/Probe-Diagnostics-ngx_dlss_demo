@@ -677,8 +677,11 @@ void NGXWrapper::EvaluateSuperSampling(nvrhi::ICommandList* commandList,
                     motionVectorsResource, exposureResource, renderingSize.Width, renderingSize.Height,
                     renderingOffset.X, renderingOffset.Y, jitterOffset.x, jitterOffset.y, mVScale.x, mVScale.y,
                     Reset != 0);
+                const bool outputTest = temporal_diagnostics::prepare_dlss_output_test(d3dcontext, resolvedColorResource);
                 Result = NGX_D3D11_EVALUATE_DLSS_EXT(d3dcontext, m_dlssFeature, m_ngxParameters, &D3D11DlssEvalParams);
                 temporal_diagnostics::log_dlss_result(static_cast<unsigned>(Result));
+                if (outputTest)
+                    temporal_diagnostics::verify_dlss_output_test(d3dcontext, resolvedColorResource, !NVSDK_NGX_FAILED(Result));
 
                 if (NVSDK_NGX_FAILED(Result) )
                 {

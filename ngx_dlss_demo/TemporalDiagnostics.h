@@ -42,5 +42,12 @@ namespace temporal_diagnostics
                          unsigned offsetX, unsigned offsetY, float jitterX, float jitterY,
                          float motionScaleX, float motionScaleY, bool reset);
     void log_dlss_result(unsigned result);
+    bool prepare_dlss_output_test(ID3D11DeviceContext* context, ID3D11Resource* output);
+    void verify_dlss_output_test(ID3D11DeviceContext* context, ID3D11Resource* output, bool evaluationSucceeded);
+    void verify_dlss_consumer(nvrhi::IDevice* device, nvrhi::ITexture* source, nvrhi::ITexture* target);
+    bool begin_tonemap_influence_test(nvrhi::IDevice* device, nvrhi::ITexture* source, nvrhi::ITexture* target);
+    void restore_tonemap_influence_source(nvrhi::IDevice* device, nvrhi::ITexture* source, nvrhi::ITexture* target);
+    void finish_tonemap_influence_test(nvrhi::IDevice* device, nvrhi::ITexture* target);
+    void verify_combined_diagnostics(nvrhi::IDevice* device, nvrhi::ITexture* source, nvrhi::ITexture* backBuffer);
 }
 #endif

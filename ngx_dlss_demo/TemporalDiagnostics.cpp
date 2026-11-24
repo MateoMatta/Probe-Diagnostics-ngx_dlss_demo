@@ -200,6 +200,211 @@ namespace
         return sign ? -result : result;
     }
 
+    struct ColorStats
+    {
+        uint64_t count = 0, nonfinite = 0, nonzero = 0, sentinel = 0;
+        float minimum[4] = { INFINITY, INFINITY, INFINITY, INFINITY };
+        float maximum[4] = { -INFINITY, -INFINITY, -INFINITY, -INFINITY };
+    };
+
+    bool sample_color(ID3D11DeviceContext* context, ID3D11Resource* resource,
+                      unsigned width, unsigned height, unsigned offsetX, unsigned offsetY,
+                      const char* label, ColorStats& stats)
+    {
+        auto& log = logger();
+        ComPtr<ID3D11Texture2D> texture;
+        HRESULT hr = resource ? resource->QueryInterface(IID_PPV_ARGS(&texture)) : E_POINTER;
+        if (FAILED(hr) || !context || context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE)
+        {
+            log.write("event=color_readback_error label=%s stage=resource_or_context hr=0x%08X",
+                      label, static_cast<unsigned>(hr));
+            return false;
+        }
+        D3D11_TEXTURE2D_DESC desc {};
+        texture->GetDesc(&desc);
+        ComPtr<ID3D11Device> device, owner;
+        context->GetDevice(&device);
+        texture->GetDevice(&owner);
+        if (!device || owner.Get() != device.Get() || desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT ||
+            desc.SampleDesc.Count != 1 || desc.ArraySize != 1 || desc.MipLevels != 1 ||
+            !region_fits(desc.Width, desc.Height, width, height, offsetX, offsetY))
+        {
+            log.write("event=color_readback_error label=%s stage=unsupported_desc format=%u size=%ux%u "
+                      "samples=%u mips=%u array=%u region=%u,%u,%u,%u same_device=%u",
+                      label, static_cast<unsigned>(desc.Format), desc.Width, desc.Height, desc.SampleDesc.Count,
+                      desc.MipLevels, desc.ArraySize, offsetX, offsetY, width, height, owner.Get() == device.Get());
+            return false;
+        }
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.BindFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        desc.MiscFlags = 0;
+        ComPtr<ID3D11Texture2D> staging;
+        hr = device->CreateTexture2D(&desc, nullptr, &staging);
+        if (FAILED(hr))
+        {
+            log.write("event=color_readback_error label=%s stage=create_staging hr=0x%08X", label, static_cast<unsigned>(hr));
+            return false;
+        }
+        context->CopyResource(staging.Get(), texture.Get());
+        D3D11_MAPPED_SUBRESOURCE mapped {};
+        hr = context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+        if (FAILED(hr))
+        {
+            log.write("event=color_readback_error label=%s stage=map hr=0x%08X", label, static_cast<unsigned>(hr));
+            return false;
+        }
+        for (unsigned y = offsetY; y < offsetY + height; ++y)
+            for (unsigned x = offsetX; x < offsetX + width; ++x)
+            {
+                uint16_t bits[4];
+                memcpy(bits, static_cast<const uint8_t*>(mapped.pData) + y * mapped.RowPitch + x * sizeof(bits), sizeof(bits));
+                if (bits[0] == 0xd000 && bits[1] == 0xd000 && bits[2] == 0xd000 && bits[3] == 0xd000)
+                    ++stats.sentinel;
+                bool finite = true, nonzero = false;
+                for (unsigned c = 0; c < 4; ++c)
+                {
+                    const float value = half_to_float(bits[c]);
+                    if (!std::isfinite(value))
+                        finite = false;
+                    else
+                    {
+                        stats.minimum[c] = (std::min)(stats.minimum[c], value);
+                        stats.maximum[c] = (std::max)(stats.maximum[c], value);
+                        nonzero = nonzero || (c < 3 && value != 0.f);
+                    }
+                }
+                ++stats.count;
+                if (!finite) ++stats.nonfinite;
+                if (nonzero) ++stats.nonzero;
+            }
+        context->Unmap(staging.Get(), 0);
+        log.write("event=color_readback label=%s resource=%p region=%u,%u,%u,%u pixels=%llu nonfinite=%llu nonzero=%llu "
+                  "min=%.8g,%.8g,%.8g,%.8g max=%.8g,%.8g,%.8g,%.8g",
+                  label, static_cast<void*>(resource), offsetX, offsetY, width, height,
+                  static_cast<unsigned long long>(stats.count), static_cast<unsigned long long>(stats.nonfinite),
+                  static_cast<unsigned long long>(stats.nonzero), stats.minimum[0], stats.minimum[1],
+                  stats.minimum[2], stats.minimum[3], stats.maximum[0], stats.maximum[1], stats.maximum[2], stats.maximum[3]);
+        return true;
+    }
+
+    bool synthetic_color_test(ID3D11DeviceContext* context)
+    {
+        uint16_t pixels[4][4][4] {};
+        for (unsigned y = 0; y < 4; ++y)
+            for (unsigned x = 0; x < 4; ++x)
+            {
+                pixels[y][x][0] = 0x4900; // 10 outside the selected region
+                if (x >= 1 && x < 3 && y >= 1 && y < 3)
+                {
+                    pixels[y][x][0] = 0x3400; // 0.25
+                    pixels[y][x][1] = 0x3800; // 0.5
+                    pixels[y][x][2] = 0x3c00; // 1
+                    pixels[y][x][3] = 0x4000; // 2
+                }
+            }
+        D3D11_TEXTURE2D_DESC desc {};
+        desc.Width = 4; desc.Height = 4; desc.MipLevels = 1; desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        desc.SampleDesc.Count = 1; desc.Usage = D3D11_USAGE_DEFAULT;
+        D3D11_SUBRESOURCE_DATA data {};
+        data.pSysMem = pixels; data.SysMemPitch = sizeof(pixels[0]);
+        ComPtr<ID3D11Device> device;
+        context->GetDevice(&device);
+        ComPtr<ID3D11Texture2D> texture;
+        const HRESULT hr = device->CreateTexture2D(&desc, &data, &texture);
+        if (FAILED(hr))
+        {
+            logger().write("event=color_selftest status=error stage=create hr=0x%08X", static_cast<unsigned>(hr));
+            return false;
+        }
+        ColorStats stats;
+        const bool read = sample_color(context, texture.Get(), 2, 2, 1, 1, "synthetic", stats);
+        const float expected[] = { 0.25f, 0.5f, 1.f, 2.f };
+        bool passed = read && stats.count == 4 && stats.nonfinite == 0 && stats.nonzero == 4;
+        for (unsigned c = 0; c < 4; ++c)
+            passed = passed && stats.minimum[c] == expected[c] && stats.maximum[c] == expected[c];
+        logger().write("event=color_selftest status=%s region=1,1,2,2 expected=0.25,0.5,1,2", passed ? "pass" : "error");
+        return passed;
+    }
+
+    bool sample_exposure(ID3D11DeviceContext* context, ID3D11Resource* resource, const char* label, float& value)
+    {
+        auto& log = logger();
+        ComPtr<ID3D11Texture2D> texture;
+        const HRESULT query = resource ? resource->QueryInterface(IID_PPV_ARGS(&texture)) : E_POINTER;
+        if (FAILED(query) || !context || context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE)
+        {
+            log.write("event=exposure_readback_error label=%s stage=resource_or_context hr=0x%08X",
+                      label, static_cast<unsigned>(query));
+            return false;
+        }
+        D3D11_TEXTURE2D_DESC desc {};
+        texture->GetDesc(&desc);
+        ComPtr<ID3D11Device> device, owner;
+        context->GetDevice(&device);
+        texture->GetDevice(&owner);
+        if (!device || owner.Get() != device.Get() || desc.Format != DXGI_FORMAT_R16_FLOAT ||
+            desc.Width != 1 || desc.Height != 1 || desc.SampleDesc.Count != 1 ||
+            desc.ArraySize != 1 || desc.MipLevels != 1)
+        {
+            log.write("event=exposure_readback_error label=%s stage=unsupported_desc format=%u size=%ux%u "
+                      "samples=%u mips=%u array=%u same_device=%u",
+                      label, static_cast<unsigned>(desc.Format), desc.Width, desc.Height, desc.SampleDesc.Count,
+                      desc.MipLevels, desc.ArraySize, owner.Get() == device.Get());
+            return false;
+        }
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.BindFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        desc.MiscFlags = 0;
+        ComPtr<ID3D11Texture2D> staging;
+        HRESULT hr = device->CreateTexture2D(&desc, nullptr, &staging);
+        if (FAILED(hr))
+        {
+            log.write("event=exposure_readback_error label=%s stage=create_staging hr=0x%08X", label, static_cast<unsigned>(hr));
+            return false;
+        }
+        context->CopyResource(staging.Get(), texture.Get());
+        D3D11_MAPPED_SUBRESOURCE mapped {};
+        hr = context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+        if (FAILED(hr))
+        {
+            log.write("event=exposure_readback_error label=%s stage=map hr=0x%08X", label, static_cast<unsigned>(hr));
+            return false;
+        }
+        uint16_t bits;
+        memcpy(&bits, mapped.pData, sizeof(bits));
+        context->Unmap(staging.Get(), 0);
+        value = half_to_float(bits);
+        log.write("event=exposure_readback label=%s resource=%p bits=0x%04X value=%.8g finite=%u",
+                  label, static_cast<void*>(resource), static_cast<unsigned>(bits), value, std::isfinite(value) ? 1u : 0u);
+        return true;
+    }
+
+    bool synthetic_exposure_test(ID3D11DeviceContext* context)
+    {
+        const uint16_t expectedBits = 0x3800;
+        D3D11_TEXTURE2D_DESC desc {};
+        desc.Width = 1; desc.Height = 1; desc.MipLevels = 1; desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_R16_FLOAT; desc.SampleDesc.Count = 1; desc.Usage = D3D11_USAGE_DEFAULT;
+        D3D11_SUBRESOURCE_DATA data {};
+        data.pSysMem = &expectedBits; data.SysMemPitch = sizeof(expectedBits);
+        ComPtr<ID3D11Device> device;
+        context->GetDevice(&device);
+        ComPtr<ID3D11Texture2D> texture;
+        const HRESULT hr = device->CreateTexture2D(&desc, &data, &texture);
+        if (FAILED(hr))
+        {
+            logger().write("event=exposure_selftest status=error stage=create hr=0x%08X", static_cast<unsigned>(hr));
+            return false;
+        }
+        float value = 0.f;
+        const bool passed = sample_exposure(context, texture.Get(), "synthetic", value) && value == 0.5f;
+        logger().write("event=exposure_selftest status=%s expected=0.5", passed ? "pass" : "error");
+        return passed;
+    }
+
     bool readback_enabled()
     {
         static const bool result = [] {
@@ -1151,6 +1356,463 @@ void log_dlss_inputs(ID3D11DeviceContext* context, ID3D11Resource* color, ID3D11
     log_resource_contract(context, "dlss", "motion", motion, true, true, width, height, offsetX, offsetY);
     log_resource_contract(context, "dlss", "output", output, true, false, width, height, offsetX, offsetY);
     log_resource_contract(context, "dlss", "exposure", exposure, false, false, width, height, offsetX, offsetY);
+    if (readback_enabled())
+    {
+        static bool tested = false;
+        static bool passed = false;
+        static unsigned captures = 0;
+        if (!tested && context && context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE)
+        {
+            tested = true;
+            passed = synthetic_color_test(context);
+        }
+        if (!passed)
+            log.write("event=color_readback_error label=dlss_color stage=selftest_or_context");
+        else if (captures < 8)
+        {
+            ColorStats stats;
+            if (sample_color(context, color, width, height, offsetX, offsetY, "dlss_color", stats))
+                ++captures;
+        }
+        if (exposure)
+        {
+            static bool exposureTested = false;
+            static bool exposurePassed = false;
+            static unsigned exposureCaptures = 0;
+            if (!exposureTested && context && context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE)
+            {
+                exposureTested = true;
+                exposurePassed = synthetic_exposure_test(context);
+            }
+            if (!exposurePassed)
+                log.write("event=exposure_readback_error label=dlss_exposure stage=selftest_or_context");
+            else if (exposureCaptures < 8)
+            {
+                float value = 0.f;
+                if (sample_exposure(context, exposure, "dlss_exposure", value))
+                    ++exposureCaptures;
+            }
+        }
+    }
+}
+
+bool output_test_enabled()
+{
+    static const bool result = [] {
+        wchar_t value[8] = {};
+        const DWORD size = GetEnvironmentVariableW(L"OPTISCALER_DEMO_OUTPUT_TEST", value, 8);
+        if (size == 0 && GetLastError() == ERROR_ENVVAR_NOT_FOUND)
+            return false;
+        if (size != 1 || value[0] != L'1')
+        {
+            donut::log::error("Temporal diagnostics: OPTISCALER_DEMO_OUTPUT_TEST must be 1");
+            return false;
+        }
+        return true;
+    }();
+    return result;
+}
+
+bool prepare_dlss_output_test(ID3D11DeviceContext* context, ID3D11Resource* output)
+{
+    auto& log = logger();
+    static unsigned captures = 0;
+    if (!log.sampled || !output_test_enabled() || captures >= 8)
+        return false;
+    ++captures;
+    ComPtr<ID3D11Texture2D> texture;
+    const HRESULT query = output ? output->QueryInterface(IID_PPV_ARGS(&texture)) : E_POINTER;
+    if (FAILED(query) || !context || context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE)
+    {
+        log.write("event=output_test_error stage=resource_or_context hr=0x%08X", static_cast<unsigned>(query));
+        return false;
+    }
+    D3D11_TEXTURE2D_DESC desc {};
+    texture->GetDesc(&desc);
+    ComPtr<ID3D11Device> device, owner;
+    context->GetDevice(&device);
+    texture->GetDevice(&owner);
+    if (!device || owner.Get() != device.Get() || desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT ||
+        desc.MipLevels != 1 || desc.ArraySize != 1 || desc.SampleDesc.Count != 1 ||
+        !(desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS))
+    {
+        log.write("event=output_test_error stage=unsupported_desc format=%u size=%ux%u bind=0x%X",
+                  static_cast<unsigned>(desc.Format), desc.Width, desc.Height, desc.BindFlags);
+        return false;
+    }
+    ComPtr<ID3D11UnorderedAccessView> uav;
+    const HRESULT hr = device->CreateUnorderedAccessView(texture.Get(), nullptr, &uav);
+    if (FAILED(hr))
+    {
+        log.write("event=output_test_error stage=create_uav hr=0x%08X", static_cast<unsigned>(hr));
+        return false;
+    }
+    const float sentinel[4] = { -32.f, -32.f, -32.f, -32.f };
+    context->ClearUnorderedAccessViewFloat(uav.Get(), sentinel);
+    ColorStats before;
+    if (!sample_color(context, output, desc.Width, desc.Height, 0, 0, "output_sentinel", before) ||
+        before.sentinel != before.count || before.count != static_cast<uint64_t>(desc.Width) * desc.Height)
+    {
+        log.write("event=output_test_error stage=sentinel_control pixels=%llu sentinel=%llu",
+                  static_cast<unsigned long long>(before.count), static_cast<unsigned long long>(before.sentinel));
+        return false;
+    }
+    log.write("event=output_test_control resource=%p pixels=%llu sentinel=%llu",
+              static_cast<void*>(output), static_cast<unsigned long long>(before.count),
+              static_cast<unsigned long long>(before.sentinel));
+    return true;
+}
+
+void verify_dlss_output_test(ID3D11DeviceContext* context, ID3D11Resource* output, bool evaluationSucceeded)
+{
+    auto& log = logger();
+    ComPtr<ID3D11Texture2D> texture;
+    const HRESULT hr = output ? output->QueryInterface(IID_PPV_ARGS(&texture)) : E_POINTER;
+    if (FAILED(hr) || !evaluationSucceeded)
+    {
+        log.write("event=output_test_error stage=evaluate_or_resource hr=0x%08X success=%u",
+                  static_cast<unsigned>(hr), evaluationSucceeded ? 1u : 0u);
+        return;
+    }
+    D3D11_TEXTURE2D_DESC desc {};
+    texture->GetDesc(&desc);
+    ColorStats after;
+    if (!sample_color(context, output, desc.Width, desc.Height, 0, 0, "dlss_output", after))
+    {
+        log.write("event=output_test_error stage=readback");
+        return;
+    }
+    const bool valid = after.count == static_cast<uint64_t>(desc.Width) * desc.Height &&
+        after.nonfinite == 0 && after.nonzero != 0 && after.sentinel == 0;
+    log.write("event=output_test_result resource=%p size=%ux%u pixels=%llu sentinel=%llu nonfinite=%llu nonzero=%llu status=%s",
+              static_cast<void*>(output), desc.Width, desc.Height, static_cast<unsigned long long>(after.count),
+              static_cast<unsigned long long>(after.sentinel), static_cast<unsigned long long>(after.nonfinite),
+              static_cast<unsigned long long>(after.nonzero), valid ? "pass" : "error");
+}
+
+void verify_dlss_consumer(nvrhi::IDevice* device, nvrhi::ITexture* source, nvrhi::ITexture* target)
+{
+    auto& log = logger();
+    if (!log.sampled || !output_test_enabled())
+        return;
+    ID3D11DeviceContext* context = device->getNativeObject(nvrhi::ObjectTypes::D3D11_DeviceContext);
+    if (!context || context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE)
+    {
+        log.write("event=output_test_error stage=consumer_context");
+        return;
+    }
+    ComPtr<ID3D11ShaderResourceView> sourceView;
+    ComPtr<ID3D11RenderTargetView> targetView;
+    context->PSGetShaderResources(0, 1, &sourceView);
+    context->OMGetRenderTargets(1, &targetView, nullptr);
+    ComPtr<ID3D11Resource> boundSource, boundTarget;
+    if (sourceView) sourceView->GetResource(&boundSource);
+    if (targetView) targetView->GetResource(&boundTarget);
+    const bool valid = native(source) && native(target) &&
+        boundSource.Get() == native(source) && boundTarget.Get() == native(target);
+    log.write("event=output_test_consumer source=%p ps_t0=%p target=%p om_rtv0=%p status=%s",
+              static_cast<void*>(native(source)), static_cast<void*>(boundSource.Get()),
+              static_cast<void*>(native(target)), static_cast<void*>(boundTarget.Get()), valid ? "pass" : "error");
+}
+
+namespace
+{
+    struct InfluenceTest
+    {
+        ComPtr<ID3D11Texture2D> original;
+        std::vector<uint8_t> before, black;
+        unsigned width = 0, height = 0;
+        bool blackRead = false;
+    };
+
+    InfluenceTest& influence_test()
+    {
+        static InfluenceTest test;
+        return test;
+    }
+
+    bool influence_enabled()
+    {
+        static const bool result = [] {
+            wchar_t value[8] = {};
+            const DWORD size = GetEnvironmentVariableW(L"OPTISCALER_DEMO_INFLUENCE_TEST", value, 8);
+            if (size == 0 && GetLastError() == ERROR_ENVVAR_NOT_FOUND)
+                return false;
+            if (size != 1 || value[0] != L'1')
+            {
+                donut::log::error("Temporal diagnostics: OPTISCALER_DEMO_INFLUENCE_TEST must be 1");
+                return false;
+            }
+            return true;
+        }();
+        return result;
+    }
+
+    bool read_ldr(ID3D11DeviceContext* context, ID3D11Resource* resource, std::vector<uint8_t>& pixels,
+                  unsigned& width, unsigned& height)
+    {
+        ComPtr<ID3D11Texture2D> texture;
+        HRESULT hr = resource ? resource->QueryInterface(IID_PPV_ARGS(&texture)) : E_POINTER;
+        if (FAILED(hr) || !context || context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE)
+        {
+            logger().write("event=influence_error stage=ldr_resource hr=0x%08X", static_cast<unsigned>(hr));
+            return false;
+        }
+        D3D11_TEXTURE2D_DESC desc {};
+        texture->GetDesc(&desc);
+        ComPtr<ID3D11Device> device, owner;
+        context->GetDevice(&device);
+        texture->GetDevice(&owner);
+        if (!device || owner.Get() != device.Get() || desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM ||
+            desc.MipLevels != 1 || desc.ArraySize != 1 || desc.SampleDesc.Count != 1)
+        {
+            logger().write("event=influence_error stage=ldr_desc format=%u size=%ux%u", static_cast<unsigned>(desc.Format), desc.Width, desc.Height);
+            return false;
+        }
+        width = desc.Width; height = desc.Height;
+        desc.Usage = D3D11_USAGE_STAGING; desc.BindFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ; desc.MiscFlags = 0;
+        ComPtr<ID3D11Texture2D> staging;
+        hr = device->CreateTexture2D(&desc, nullptr, &staging);
+        if (FAILED(hr))
+        {
+            logger().write("event=influence_error stage=ldr_staging hr=0x%08X", static_cast<unsigned>(hr));
+            return false;
+        }
+        context->CopyResource(staging.Get(), texture.Get());
+        D3D11_MAPPED_SUBRESOURCE mapped {};
+        hr = context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+        if (FAILED(hr))
+        {
+            logger().write("event=influence_error stage=ldr_map hr=0x%08X", static_cast<unsigned>(hr));
+            return false;
+        }
+        pixels.resize(static_cast<size_t>(width) * height * 4);
+        for (unsigned y = 0; y < height; ++y)
+            memcpy(pixels.data() + static_cast<size_t>(y) * width * 4,
+                   static_cast<const uint8_t*>(mapped.pData) + static_cast<size_t>(y) * mapped.RowPitch,
+                   static_cast<size_t>(width) * 4);
+        context->Unmap(staging.Get(), 0);
+        return true;
+    }
+}
+
+bool begin_tonemap_influence_test(nvrhi::IDevice* device, nvrhi::ITexture* source, nvrhi::ITexture* target)
+{
+    auto& log = logger();
+    if (!influence_enabled() || log.frame != 120)
+        return false;
+    auto& test = influence_test();
+    ID3D11DeviceContext* context = device->getNativeObject(nvrhi::ObjectTypes::D3D11_DeviceContext);
+    if (!read_ldr(context, native(target), test.before, test.width, test.height))
+        return false;
+    ComPtr<ID3D11Texture2D> texture;
+    HRESULT hr = native(source) ? native(source)->QueryInterface(IID_PPV_ARGS(&texture)) : E_POINTER;
+    if (FAILED(hr) || !context)
+    {
+        log.write("event=influence_error stage=source hr=0x%08X", static_cast<unsigned>(hr));
+        return false;
+    }
+    D3D11_TEXTURE2D_DESC desc {};
+    texture->GetDesc(&desc);
+    ComPtr<ID3D11Device> owner, contextDevice;
+    texture->GetDevice(&owner); context->GetDevice(&contextDevice);
+    if (!owner || owner.Get() != contextDevice.Get() || desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT ||
+        desc.MipLevels != 1 || desc.ArraySize != 1 || desc.SampleDesc.Count != 1 ||
+        !(desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS))
+    {
+        log.write("event=influence_error stage=source_desc format=%u bind=0x%X", static_cast<unsigned>(desc.Format), desc.BindFlags);
+        return false;
+    }
+    ComPtr<ID3D11UnorderedAccessView> uav;
+    hr = owner->CreateUnorderedAccessView(texture.Get(), nullptr, &uav);
+    if (FAILED(hr))
+    {
+        log.write("event=influence_error stage=uav hr=0x%08X", static_cast<unsigned>(hr));
+        return false;
+    }
+    desc.BindFlags = 0; desc.MiscFlags = 0;
+    hr = owner->CreateTexture2D(&desc, nullptr, &test.original);
+    if (FAILED(hr))
+    {
+        log.write("event=influence_error stage=backup hr=0x%08X", static_cast<unsigned>(hr));
+        return false;
+    }
+    context->CopyResource(test.original.Get(), texture.Get());
+    const float black[4] = { 0.f, 0.f, 0.f, 0.f };
+    context->ClearUnorderedAccessViewFloat(uav.Get(), black);
+    ColorStats cleared;
+    if (!sample_color(context, texture.Get(), desc.Width, desc.Height, 0, 0, "influence_black", cleared) ||
+        cleared.nonzero != 0 || cleared.nonfinite != 0 ||
+        cleared.count != static_cast<uint64_t>(desc.Width) * desc.Height)
+    {
+        context->CopyResource(texture.Get(), test.original.Get());
+        test.original.Reset();
+        log.write("event=influence_error stage=black_control");
+        return false;
+    }
+    log.write("event=influence_begin source=%p target=%p pixels=%llu black_rgb=%llu",
+              static_cast<void*>(texture.Get()), static_cast<void*>(native(target)),
+              static_cast<unsigned long long>(cleared.count), static_cast<unsigned long long>(cleared.nonzero));
+    return true;
+}
+
+void restore_tonemap_influence_source(nvrhi::IDevice* device, nvrhi::ITexture* source, nvrhi::ITexture* target)
+{
+    auto& test = influence_test();
+    ID3D11DeviceContext* context = device->getNativeObject(nvrhi::ObjectTypes::D3D11_DeviceContext);
+    unsigned width = 0, height = 0;
+    test.blackRead = read_ldr(context, native(target), test.black, width, height) &&
+        width == test.width && height == test.height;
+    if (!test.blackRead)
+        logger().write("event=influence_error stage=black_target");
+    context->CopyResource(native(source), test.original.Get());
+    test.original.Reset();
+}
+
+void finish_tonemap_influence_test(nvrhi::IDevice* device, nvrhi::ITexture* target)
+{
+    auto& test = influence_test();
+    auto& log = logger();
+    ID3D11DeviceContext* context = device->getNativeObject(nvrhi::ObjectTypes::D3D11_DeviceContext);
+    std::vector<uint8_t> restored;
+    unsigned width = 0, height = 0;
+    if (!test.blackRead || !read_ldr(context, native(target), restored, width, height) ||
+        width != test.width || height != test.height || restored.size() != test.before.size() ||
+        test.black.size() != test.before.size())
+    {
+        log.write("event=influence_error stage=restored_target");
+        return;
+    }
+    uint64_t changed = 0, restorationMismatch = 0;
+    for (size_t i = 0; i < restored.size(); i += 4)
+    {
+        if (test.before[i] != test.black[i] || test.before[i + 1] != test.black[i + 1] ||
+            test.before[i + 2] != test.black[i + 2])
+            ++changed;
+        if (test.before[i] != restored[i] || test.before[i + 1] != restored[i + 1] ||
+            test.before[i + 2] != restored[i + 2] || test.before[i + 3] != restored[i + 3])
+            ++restorationMismatch;
+    }
+    const uint64_t total = static_cast<uint64_t>(width) * height;
+    const bool valid = changed * 100 >= total && restorationMismatch == 0;
+    log.write("event=influence_result target=%p size=%ux%u pixels=%llu changed_rgb=%llu restore_mismatch=%llu status=%s",
+              static_cast<void*>(native(target)), width, height, static_cast<unsigned long long>(total),
+              static_cast<unsigned long long>(changed), static_cast<unsigned long long>(restorationMismatch),
+              valid ? "pass" : "error");
+}
+
+void verify_combined_diagnostics(nvrhi::IDevice* device, nvrhi::ITexture* source, nvrhi::ITexture* backBuffer)
+{
+    auto& log = logger();
+    if (!influence_enabled() || !output_test_enabled() || log.frame != 120)
+        return;
+    ID3D11DeviceContext* context = device->getNativeObject(nvrhi::ObjectTypes::D3D11_DeviceContext);
+    if (!context || context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE)
+    {
+        log.write("event=combined_error stage=context");
+        return;
+    }
+    ComPtr<ID3D11Device> nativeDevice;
+    context->GetDevice(&nativeDevice);
+    ComPtr<ID3D11ShaderResourceView> sourceView;
+    ComPtr<ID3D11RenderTargetView> targetView;
+    context->PSGetShaderResources(0, 1, &sourceView);
+    context->OMGetRenderTargets(1, &targetView, nullptr);
+    ComPtr<ID3D11Resource> boundSource, boundTarget;
+    if (sourceView) sourceView->GetResource(&boundSource);
+    if (targetView) targetView->GetResource(&boundTarget);
+    std::vector<uint8_t> pixels;
+    unsigned width = 0, height = 0;
+    if (!nativeDevice || !native(source) || !native(backBuffer) ||
+        boundSource.Get() != native(source) || boundTarget.Get() != native(backBuffer) ||
+        !read_ldr(context, native(backBuffer), pixels, width, height))
+    {
+        log.write("event=combined_error stage=backbuffer_or_binding");
+        return;
+    }
+    uint64_t nonblack = 0;
+    for (size_t i = 0; i < pixels.size(); i += 4)
+        if (pixels[i] || pixels[i + 1] || pixels[i + 2]) ++nonblack;
+    log.write("event=combined_backbuffer source=%p ps_t0=%p target=%p om_rtv0=%p size=%ux%u pixels=%llu nonblack=%llu status=%s",
+              static_cast<void*>(native(source)), static_cast<void*>(boundSource.Get()),
+              static_cast<void*>(native(backBuffer)), static_cast<void*>(boundTarget.Get()), width, height,
+              static_cast<unsigned long long>(static_cast<uint64_t>(width) * height),
+              static_cast<unsigned long long>(nonblack), nonblack ? "pass" : "error");
+
+    D3D11_TEXTURE2D_DESC desc {};
+    desc.Width = 16; desc.Height = 16; desc.MipLevels = 1; desc.ArraySize = 1;
+    desc.SampleDesc.Count = 1; desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.Format = DXGI_FORMAT_R24G8_TYPELESS;
+    desc.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
+    ComPtr<ID3D11Texture2D> texture;
+    HRESULT hr = nativeDevice->CreateTexture2D(&desc, nullptr, &texture);
+    D3D11_DEPTH_STENCIL_VIEW_DESC dsvDesc {};
+    dsvDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    dsvDesc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+    ComPtr<ID3D11DepthStencilView> dsv;
+    if (SUCCEEDED(hr)) hr = nativeDevice->CreateDepthStencilView(texture.Get(), &dsvDesc, &dsv);
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc {};
+    srvDesc.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Texture2D.MipLevels = 1;
+    ComPtr<ID3D11ShaderResourceView> srv;
+    if (SUCCEEDED(hr)) hr = nativeDevice->CreateShaderResourceView(texture.Get(), &srvDesc, &srv);
+    if (FAILED(hr))
+    {
+        log.write("event=combined_error stage=depth_views hr=0x%08X", static_cast<unsigned>(hr));
+        return;
+    }
+    ComPtr<ID3D11Resource> dsvResource, srvResource;
+    dsv->GetResource(&dsvResource); srv->GetResource(&srvResource);
+    context->ClearDepthStencilView(dsv.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 0.25f, 73);
+    context->ClearDepthStencilView(dsv.Get(), D3D11_CLEAR_DEPTH, 0.75f, 0);
+    Stats stats;
+    const bool read = sample_texture(context, texture.Get(), true, 16, 16, 0, 0, "combined_depth", stats);
+    bool valid = read && dsvResource.Get() == texture.Get() && srvResource.Get() == texture.Get() &&
+        stats.count == 256 && stats.nonfinite == 0;
+    for (unsigned i = 0; i < stats.count; ++i)
+        valid = valid && std::fabs(stats.x[i] - 0.75f) < 0.000001f && stats.stencil[i] == 73;
+    log.write("event=combined_depth format=d24s8 views=dsv,srv depth=0.75 stencil=73 samples=%u status=%s",
+              stats.count, valid ? "pass" : "error");
+    desc.Format = DXGI_FORMAT_R32_TYPELESS;
+    ComPtr<ID3D11Texture2D> depth32;
+    hr = nativeDevice->CreateTexture2D(&desc, nullptr, &depth32);
+    dsvDesc.Format = DXGI_FORMAT_D32_FLOAT;
+    ComPtr<ID3D11DepthStencilView> dsv32;
+    if (SUCCEEDED(hr)) hr = nativeDevice->CreateDepthStencilView(depth32.Get(), &dsvDesc, &dsv32);
+    srvDesc.Format = DXGI_FORMAT_R32_FLOAT;
+    ComPtr<ID3D11ShaderResourceView> srv32;
+    if (SUCCEEDED(hr)) hr = nativeDevice->CreateShaderResourceView(depth32.Get(), &srvDesc, &srv32);
+    desc.Usage = D3D11_USAGE_STAGING; desc.BindFlags = 0; desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ComPtr<ID3D11Texture2D> stage32;
+    if (SUCCEEDED(hr)) hr = nativeDevice->CreateTexture2D(&desc, nullptr, &stage32);
+    if (FAILED(hr))
+    {
+        log.write("event=combined_error stage=depth32_setup hr=0x%08X", static_cast<unsigned>(hr));
+        return;
+    }
+    dsvResource.Reset(); srvResource.Reset();
+    dsv32->GetResource(&dsvResource); srv32->GetResource(&srvResource);
+    context->ClearDepthStencilView(dsv32.Get(), D3D11_CLEAR_DEPTH, 0.125f, 0);
+    context->CopyResource(stage32.Get(), depth32.Get());
+    D3D11_MAPPED_SUBRESOURCE mapped {};
+    hr = context->Map(stage32.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr))
+    {
+        log.write("event=combined_error stage=depth32_map hr=0x%08X", static_cast<unsigned>(hr));
+        return;
+    }
+    valid = dsvResource.Get() == depth32.Get() && srvResource.Get() == depth32.Get();
+    for (unsigned y = 0; y < 16; ++y)
+        for (unsigned x = 0; x < 16; ++x)
+        {
+            float value;
+            memcpy(&value, static_cast<const uint8_t*>(mapped.pData) + y * mapped.RowPitch + x * sizeof(float), sizeof(value));
+            valid = valid && value == 0.125f;
+        }
+    context->Unmap(stage32.Get(), 0);
+    log.write("event=combined_depth format=d32 views=dsv,srv depth=0.125 samples=256 status=%s", valid ? "pass" : "error");
 }
 
 void log_dlss_result(unsigned result)

@@ -1399,6 +1399,19 @@ public:
         if (preTonemapping)
         {
             m_ToneMappingPass->SimpleRender(m_CommandList, m_ui.ToneMappingParams, *m_TonemappingView, postResolveColor);
+#if USE_DX11
+            if (m_ui.AntiAliasingMode == UIData::AntiAliasingMode::DLSS && temporal_diagnostics::enabled(GetDevice()))
+            {
+                temporal_diagnostics::verify_dlss_consumer(GetDevice(), postResolveColor, m_RenderTargets->m_LdrColor);
+                if (temporal_diagnostics::begin_tonemap_influence_test(GetDevice(), postResolveColor, m_RenderTargets->m_LdrColor))
+                {
+                    m_ToneMappingPass->Render(m_CommandList, m_ui.ToneMappingParams, *m_TonemappingView, postResolveColor);
+                    temporal_diagnostics::restore_tonemap_influence_source(GetDevice(), postResolveColor, m_RenderTargets->m_LdrColor);
+                    m_ToneMappingPass->Render(m_CommandList, m_ui.ToneMappingParams, *m_TonemappingView, postResolveColor);
+                    temporal_diagnostics::finish_tonemap_influence_test(GetDevice(), m_RenderTargets->m_LdrColor);
+                }
+            }
+#endif
             finalTonemappedColor = m_RenderTargets->m_LdrColor;
         }
         else
@@ -1409,6 +1422,10 @@ public:
 
         m_CommonPasses->BlitTexture(m_CommandList, framebuffer, windowViewport, box2(0.f, 1.f), finalTonemappedColor, box2(0.f, 1.f));
 
+#if USE_DX11
+        if (m_ui.AntiAliasingMode == UIData::AntiAliasingMode::DLSS && temporal_diagnostics::enabled(GetDevice()))
+            temporal_diagnostics::verify_combined_diagnostics(GetDevice(), finalTonemappedColor, framebufferTexture);
+#endif
         m_ToneMappingPass->SaveCurrentState(m_CommandList);
 
         m_CommandList->close();

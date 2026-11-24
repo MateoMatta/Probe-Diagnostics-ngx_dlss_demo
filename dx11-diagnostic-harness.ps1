@@ -13,6 +13,11 @@ param(
     [switch]$ResizeDlssOnly,
     [switch]$MultiSwapOnly,
     [switch]$LateAddonOnly,
+    [switch]$ColorOnly,
+    [switch]$ExposureOnly,
+    [switch]$OutputOnly,
+    [switch]$InfluenceOnly,
+    [switch]$CombinedOnly,
     [switch]$StressFps
 )
 
@@ -39,7 +44,7 @@ $environmentNames = @('OPTISCALER_DEMO_TRACE', 'OPTISCALER_DEMO_READBACK',
     'OPTISCALER_PROBE_SHADER_BINDINGS', 'OPTISCALER_DEMO_GPU_SYNC_TEST',
     'OPTISCALER_DEMO_IDENTITY_SELFTEST', 'OPTISCALER_PROBE_RESOURCE_LIFETIMES',
     'OPTISCALER_DEMO_GPU_PIPELINE_TEST', 'OPTISCALER_DEMO_MULTISWAP_TEST',
-    'OPTISCALER_DEMO_LATE_ADDON_PATH', 'DONUT_MEDIA_PATH')
+    'OPTISCALER_DEMO_LATE_ADDON_PATH', 'OPTISCALER_DEMO_OUTPUT_TEST', 'OPTISCALER_DEMO_INFLUENCE_TEST', 'DONUT_MEDIA_PATH')
 $previousEnvironment = @{}
 foreach ($name in $environmentNames) {
     $previousEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
@@ -64,7 +69,7 @@ $cases = @(
     @{ Name = 'all-target-bindings'; Args = '-aamode dlss'; Readback = $false },
     @{ Name = 'shader-bindings'; Args = '-aamode temporal'; Readback = $false }
 )
-if (@($ShaderBindingsOnly, $OverlapOnly, $IdentityOnly, $DxgiAdapterOnly, $ResizeOnly, $ResizeDlssOnly, $GpuPipelineOnly, $CameraOnly, $MultiSwapOnly, $LateAddonOnly | Where-Object { $_ }).Count -gt 1) {
+if (@($ShaderBindingsOnly, $OverlapOnly, $IdentityOnly, $DxgiAdapterOnly, $ResizeOnly, $ResizeDlssOnly, $GpuPipelineOnly, $CameraOnly, $MultiSwapOnly, $LateAddonOnly, $ColorOnly, $ExposureOnly, $OutputOnly, $InfluenceOnly, $CombinedOnly | Where-Object { $_ }).Count -gt 1) {
     throw 'Select only one targeted harness mode'
 }
 if ($ShaderBindingsOnly) {
@@ -97,11 +102,20 @@ if ($LateAddonOnly) {
 if ($CameraOnly) {
     $cases = @($cases | Where-Object { $_.Name -eq 'camera-temporal' })
 }
+if ($ColorOnly -or $ExposureOnly -or $OutputOnly -or $InfluenceOnly -or $CombinedOnly) {
+    $cases = @($cases | Where-Object { $_.Name -eq 'objects-dlss-camera' })
+}
 
 try {
     $baselineHashes = @{}
     [Environment]::SetEnvironmentVariable('OPTISCALER_DEMO_TRACE', '1', 'Process')
     [Environment]::SetEnvironmentVariable('OPTISCALER_PROBE_DETAIL_START', $null, 'Process')
+    $outputTest = $null
+    if ($OutputOnly -or $CombinedOnly) { $outputTest = '1' }
+    [Environment]::SetEnvironmentVariable('OPTISCALER_DEMO_OUTPUT_TEST', $outputTest, 'Process')
+    $influenceTest = $null
+    if ($InfluenceOnly -or $CombinedOnly) { $influenceTest = '1' }
+    [Environment]::SetEnvironmentVariable('OPTISCALER_DEMO_INFLUENCE_TEST', $influenceTest, 'Process')
     [Environment]::SetEnvironmentVariable('DONUT_MEDIA_PATH', $media, 'Process')
     foreach ($case in $cases) {
         $readback = $null
@@ -399,10 +413,124 @@ try {
             throw "$($case.Name): missing clean logger shutdown"
         }
         if (@($trace | Where-Object {
-            $_ -match 'event=(readback_error|stencil_clear_error|taa_binding_error|gpu_sync_error|temporal_parameter_error|multiswap_error|late_addon_error)\b' -or
-            $_ -match 'event=resource_contract(?:_selftest)?\b.*\bstatus=error\b'
+            $_ -match 'event=(readback_error|color_readback_error|exposure_readback_error|output_test_error|influence_error|combined_error|stencil_clear_error|taa_binding_error|gpu_sync_error|temporal_parameter_error|multiswap_error|late_addon_error)\b' -or
+            $_ -match 'event=(resource_contract(?:_selftest)?|color_selftest|exposure_selftest|output_test_result|output_test_consumer|influence_result|combined_depth|combined_backbuffer)\b.*\bstatus=error\b'
         }).Count) {
             throw "$($case.Name): diagnostic error; inspect archived trace"
+        }
+        if ($case.Name -in @('objects-dlss-camera', 'stencil-reset')) {
+            $selftest = @($trace | Where-Object { $_ -match 'event=color_selftest status=pass region=1,1,2,2' })
+            $colors = @($trace | Where-Object { $_ -match 'event=color_readback label=dlss_color\b' })
+            if ($selftest.Count -ne 1 -or $colors.Count -lt 1) {
+                throw "$($case.Name): missing color selftest or DLSS color readback"
+            }
+            foreach ($color in $colors) {
+                if ($color -notmatch '\bframe=(\d+) event=color_readback label=dlss_color resource=([0-9A-Fa-f]+) region=(\d+),(\d+),(\d+),(\d+) pixels=(\d+) nonfinite=(\d+) nonzero=(\d+)') {
+                    throw "$($case.Name): malformed color readback: $color"
+                }
+                $frame = $Matches[1]; $resource = $Matches[2]; $x = $Matches[3]; $y = $Matches[4]
+                $width = [long]$Matches[5]; $height = [long]$Matches[6]
+                if ([long]$Matches[7] -ne $width * $height -or [long]$Matches[8] -ne 0 -or [long]$Matches[9] -eq 0) {
+                    throw "$($case.Name): invalid or all-black RGB input color: $color"
+                }
+                $inputs = @($trace | Where-Object {
+                    $_ -match "\bframe=$frame event=ngx_dx11_evaluate_inputs color=$resource\b.*render=${width}x${height} offset=$x,$y\b"
+                })
+                if ($inputs.Count -ne 1) {
+                    throw "$($case.Name): color readback does not match the NGX input and region: $color"
+                }
+            }
+            Write-Output "COLOR_READBACK selftest=pass captures=$($colors.Count) finite=1 input_identity=matched"
+            $exposureTest = @($trace | Where-Object { $_ -match 'event=exposure_selftest status=pass expected=0.5' })
+            $exposures = @($trace | Where-Object { $_ -match 'event=exposure_readback label=dlss_exposure\b' })
+            if ($exposureTest.Count -ne 1 -or $exposures.Count -lt 1) {
+                throw "$($case.Name): missing exposure selftest or DLSS exposure readback"
+            }
+            foreach ($exposure in $exposures) {
+                if ($exposure -notmatch '\bframe=(\d+) event=exposure_readback label=dlss_exposure resource=([0-9A-Fa-f]+) bits=0x[0-9A-Fa-f]+ value=\S+ finite=1\b') {
+                    throw "$($case.Name): malformed or non-finite exposure readback: $exposure"
+                }
+                $frame = $Matches[1]; $resource = $Matches[2]
+                $inputs = @($trace | Where-Object {
+                    $_ -match "\bframe=$frame event=ngx_dx11_evaluate_inputs\b.*exposure=$resource\b"
+                })
+                if ($inputs.Count -ne 1) {
+                    throw "$($case.Name): exposure readback does not match the NGX input: $exposure"
+                }
+            }
+            Write-Output "EXPOSURE_READBACK selftest=pass captures=$($exposures.Count) finite=1 input_identity=matched"
+            if ($InfluenceOnly -or $CombinedOnly) {
+                $begin = @($trace | Where-Object { $_ -match '\bframe=120 event=influence_begin\b' })
+                $results = @($trace | Where-Object { $_ -match '\bframe=120 event=influence_result\b' })
+                if ($begin.Count -ne 1 -or $results.Count -ne 1 -or
+                    $begin[0] -notmatch '\bsource=([0-9A-Fa-f]+) target=([0-9A-Fa-f]+) pixels=(\d+) black_rgb=0\b') {
+                    throw "$($case.Name): missing influence test control"
+                }
+                $source = $Matches[1]; $target = $Matches[2]; $sourcePixels = [long]$Matches[3]
+                if ($results[0] -notmatch "\btarget=$target size=(\d+)x(\d+) pixels=(\d+) changed_rgb=(\d+) restore_mismatch=0 status=pass\b") {
+                    throw "$($case.Name): invalid influence result"
+                }
+                $width = [long]$Matches[1]; $height = [long]$Matches[2]
+                $pixels = [long]$Matches[3]; $changed = [long]$Matches[4]
+                if ($pixels -ne $width * $height -or $sourcePixels -ne $pixels -or $changed * 100 -lt $pixels) {
+                    throw "$($case.Name): insufficient changed pixels"
+                }
+                $inputs = @($trace | Where-Object { $_ -match "\bframe=120 event=ngx_dx11_evaluate_inputs\b.*output=$source\b" })
+                $evaluations = @($trace | Where-Object { $_ -match '\bframe=120 event=ngx_dx11_evaluate_result result=0x00000001\b' })
+                if ($inputs.Count -ne 1 -or $evaluations.Count -ne 1) { throw "$($case.Name): NGX output not correlated" }
+                Write-Output "TONEMAP_INFLUENCE pixels=$pixels changed_rgb=$changed restored=exact exposure_recomputed=0"
+            }
+            if ($OutputOnly -or $CombinedOnly) {
+                $results = @($trace | Where-Object { $_ -match 'event=output_test_result\b' })
+                if ($results.Count -ne 8) { throw "$($case.Name): expected 8 output tests, got $($results.Count)" }
+                foreach ($result in $results) {
+                    if ($result -notmatch '\bframe=(\d+) event=output_test_result resource=([0-9A-Fa-f]+) size=(\d+)x(\d+) pixels=(\d+) sentinel=0 nonfinite=0 nonzero=(\d+) status=pass') {
+                        throw "$($case.Name): invalid output test: $result"
+                    }
+                    $frame = $Matches[1]; $resource = $Matches[2]; $width = [long]$Matches[3]; $height = [long]$Matches[4]
+                    $pixels = [long]$Matches[5]; $nonzero = [long]$Matches[6]
+                    if ($pixels -ne $width * $height -or $nonzero -eq 0) { throw "$($case.Name): invalid output pixel count" }
+                    $controls = @($trace | Where-Object { $_ -match "\bframe=$frame event=output_test_control resource=$resource pixels=$pixels sentinel=$pixels\b" })
+                    $inputs = @($trace | Where-Object { $_ -match "\bframe=$frame event=ngx_dx11_evaluate_inputs\b.*output=$resource\b" })
+                    $evaluations = @($trace | Where-Object { $_ -match "\bframe=$frame event=ngx_dx11_evaluate_result\b" })
+                    $consumers = @($trace | Where-Object { $_ -match "\bframe=$frame event=output_test_consumer source=$resource ps_t0=$resource target=([0-9A-Fa-f]+) om_rtv0=\1 status=pass\b" })
+                    if ($controls.Count -ne 1 -or $inputs.Count -ne 1 -or $evaluations.Count -ne 1 -or $consumers.Count -ne 1) {
+                        throw "$($case.Name): sentinel, NGX output, or tone-map binding mismatch on frame $frame"
+                    }
+                    $qpcs = @()
+                    foreach ($entry in @($inputs[0], $controls[0], $evaluations[0], $result, $consumers[0])) {
+                        if ($entry -notmatch '\bqpc=(\d+)\b') { throw "$($case.Name): output event has no QPC" }
+                        $qpcs += [long]$Matches[1]
+                    }
+                    for ($i = 1; $i -lt $qpcs.Count; ++$i) {
+                        if ($qpcs[$i] -le $qpcs[$i - 1]) { throw "$($case.Name): output event ordering is invalid" }
+                    }
+                }
+                Write-Output "OUTPUT_TEST frames=$($results.Count) sentinel_overwritten=1 tone_map_bindings=matched"
+            }
+            if ($CombinedOnly) {
+                $depth24 = @($trace | Where-Object { $_ -match '\bframe=120 event=combined_depth format=d24s8 views=dsv,srv depth=0.75 stencil=73 samples=256 status=pass\b' })
+                $depth32 = @($trace | Where-Object { $_ -match '\bframe=120 event=combined_depth format=d32 views=dsv,srv depth=0.125 samples=256 status=pass\b' })
+                $back = @($trace | Where-Object { $_ -match '\bframe=120 event=combined_backbuffer\b' })
+                if ($depth24.Count -ne 1 -or $depth32.Count -ne 1 -or $back.Count -ne 1 -or
+                    $back[0] -notmatch '\bsource=([0-9A-Fa-f]+) ps_t0=\1 target=([0-9A-Fa-f]+) om_rtv0=\2 size=(\d+)x(\d+) pixels=(\d+) nonblack=(\d+) status=pass\b') {
+                    throw "$($case.Name): combined depth or backbuffer test failed"
+                }
+                $source = $Matches[1]; $target = $Matches[2].TrimStart('0'); $width = [long]$Matches[3]; $height = [long]$Matches[4]
+                $pixels = [long]$Matches[5]; $nonblack = [long]$Matches[6]
+                if ($pixels -ne $width * $height -or $nonblack -eq 0) { throw "$($case.Name): invalid backbuffer content" }
+                $influence = @($trace | Where-Object { $_ -match "\bframe=120 event=influence_result target=$source\b.*status=pass\b" })
+                if ($influence.Count -ne 1 -or $influence[0] -notmatch '\bqpc=(\d+)\b') {
+                    throw "$($case.Name): backbuffer source is not the influence-tested target"
+                }
+                $influenceQpc = [long]$Matches[1]
+                if ($back[0] -notmatch '\bqpc=(\d+)\b' -or [long]$Matches[1] -le $influenceQpc) {
+                    throw "$($case.Name): backbuffer check did not follow tone-map influence test"
+                }
+                $swap = @($addon | Where-Object { $_ -match "event=back_buffer index=0 resource=0x0*$target\b" })
+                if ($swap.Count -lt 1) { throw "$($case.Name): target was not observed as swapchain backbuffer" }
+                Write-Output "COMBINED depth=d24s8,d32 backbuffer_pixels=$pixels nonblack=$nonblack swapchain=matched"
+            }
         }
         if ($case.Name -eq 'late-addon-resource') {
             $created = @($trace | Where-Object { $_ -match 'event=late_addon_texture_created resource=([0-9A-Fa-f]+)' })
