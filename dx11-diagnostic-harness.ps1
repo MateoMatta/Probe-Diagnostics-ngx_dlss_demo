@@ -11,6 +11,7 @@ param(
     [switch]$GpuPipelineOnly,
     [switch]$CameraOnly,
     [switch]$ResizeDlssOnly,
+    [switch]$MultiSwapOnly,
     [switch]$StressFps
 )
 
@@ -36,7 +37,7 @@ $environmentNames = @('OPTISCALER_DEMO_TRACE', 'OPTISCALER_DEMO_READBACK',
     'OPTISCALER_PROBE_DETAIL_START', 'OPTISCALER_PROBE_ALL_TARGET_BINDINGS',
     'OPTISCALER_PROBE_SHADER_BINDINGS', 'OPTISCALER_DEMO_GPU_SYNC_TEST',
     'OPTISCALER_DEMO_IDENTITY_SELFTEST', 'OPTISCALER_PROBE_RESOURCE_LIFETIMES',
-    'OPTISCALER_DEMO_GPU_PIPELINE_TEST', 'DONUT_MEDIA_PATH')
+    'OPTISCALER_DEMO_GPU_PIPELINE_TEST', 'OPTISCALER_DEMO_MULTISWAP_TEST', 'DONUT_MEDIA_PATH')
 $previousEnvironment = @{}
 foreach ($name in $environmentNames) {
     $previousEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
@@ -55,11 +56,12 @@ $cases = @(
     @{ Name = 'resource-resize'; Args = '-aamode temporal -diagnostic-resize'; Readback = $false },
     @{ Name = 'resource-resize-dlss'; Args = '-aamode dlss -diagnostic-resize'; Readback = $false },
     @{ Name = 'gpu-pipeline'; Args = '-aamode temporal'; Readback = $false },
+    @{ Name = 'multi-swapchain'; Args = '-aamode temporal'; Readback = $false },
     @{ Name = 'frame-correlation'; Args = '-aamode dlss'; Readback = $false },
     @{ Name = 'all-target-bindings'; Args = '-aamode dlss'; Readback = $false },
     @{ Name = 'shader-bindings'; Args = '-aamode temporal'; Readback = $false }
 )
-if (@($ShaderBindingsOnly, $OverlapOnly, $IdentityOnly, $DxgiAdapterOnly, $ResizeOnly, $ResizeDlssOnly, $GpuPipelineOnly, $CameraOnly | Where-Object { $_ }).Count -gt 1) {
+if (@($ShaderBindingsOnly, $OverlapOnly, $IdentityOnly, $DxgiAdapterOnly, $ResizeOnly, $ResizeDlssOnly, $GpuPipelineOnly, $CameraOnly, $MultiSwapOnly | Where-Object { $_ }).Count -gt 1) {
     throw 'Select only one targeted harness mode'
 }
 if ($ShaderBindingsOnly) {
@@ -82,6 +84,9 @@ if ($ResizeDlssOnly) {
 }
 if ($GpuPipelineOnly) {
     $cases = @($cases | Where-Object { $_.Name -eq 'gpu-pipeline' })
+}
+if ($MultiSwapOnly) {
+    $cases = @($cases | Where-Object { $_.Name -eq 'multi-swapchain' })
 }
 if ($CameraOnly) {
     $cases = @($cases | Where-Object { $_.Name -eq 'camera-temporal' })
@@ -110,11 +115,14 @@ try {
         if ($case.Name -eq 'identity-selftest') { $identity = '1' }
         [Environment]::SetEnvironmentVariable('OPTISCALER_DEMO_IDENTITY_SELFTEST', $identity, 'Process')
         $lifetimes = $null
-        if ($case.Name -in @('resource-resize', 'resource-resize-dlss')) { $lifetimes = '1' }
+        if ($case.Name -in @('resource-resize', 'resource-resize-dlss', 'multi-swapchain')) { $lifetimes = '1' }
         [Environment]::SetEnvironmentVariable('OPTISCALER_PROBE_RESOURCE_LIFETIMES', $lifetimes, 'Process')
         $pipeline = $null
         if ($case.Name -eq 'gpu-pipeline') { $pipeline = '1' }
         [Environment]::SetEnvironmentVariable('OPTISCALER_DEMO_GPU_PIPELINE_TEST', $pipeline, 'Process')
+        $multiSwap = $null
+        if ($case.Name -eq 'multi-swapchain') { $multiSwap = '1' }
+        [Environment]::SetEnvironmentVariable('OPTISCALER_DEMO_MULTISWAP_TEST', $multiSwap, 'Process')
         $caseDirectory = Join-Path $output $case.Name
         New-Item -ItemType Directory -Path $caseDirectory | Out-Null
         $existingLogs = @{}
@@ -375,10 +383,82 @@ try {
             throw "$($case.Name): missing clean logger shutdown"
         }
         if (@($trace | Where-Object {
-            $_ -match 'event=(readback_error|stencil_clear_error|taa_binding_error|gpu_sync_error|temporal_parameter_error)\b' -or
+            $_ -match 'event=(readback_error|stencil_clear_error|taa_binding_error|gpu_sync_error|temporal_parameter_error|multiswap_error)\b' -or
             $_ -match 'event=resource_contract(?:_selftest)?\b.*\bstatus=error\b'
         }).Count) {
             throw "$($case.Name): diagnostic error; inspect archived trace"
+        }
+        if ($case.Name -eq 'multi-swapchain') {
+            $created = @($trace | Where-Object { $_ -match 'event=multiswap_created index=[01] chain=' })
+            if ($created.Count -ne 2 -or
+                @($trace | Where-Object { $_ -match 'event=multiswap_result status=pass chains=2 first=96x64 second=64x64' }).Count -ne 1 -or
+                @($addon | Where-Object { $_ -match 'event=(resource_lifetime_error|swapchain_buffer_epoch_error)\b' }).Count) {
+                throw "$($case.Name): multi-swapchain self-test failed"
+            }
+            $initChains = @($addon | Where-Object { $_ -match 'event=init_swapchain swapchain=.*resize=0\b' })
+            if ($initChains.Count -lt 3) {
+                throw "$($case.Name): ReShade did not observe the primary and both test swapchains"
+            }
+            $ids = @()
+            foreach ($index in 0..1) {
+                $marker = @($created | Where-Object { $_ -match "event=multiswap_created index=$index\b" })
+                if ($marker.Count -ne 1 -or $marker[0] -notmatch '\bhwnd=([0-9A-Fa-f]+)') {
+                    throw "$($case.Name): missing window for swapchain $index"
+                }
+                $hwnd = $Matches[1]
+                $init = @($initChains | Where-Object { $_ -match "\bhwnd=$hwnd\b" })
+                if ($init.Count -ne 1 -or $init[0] -notmatch '\bswapchain=([0-9A-Fa-f]+)') {
+                    throw "$($case.Name): cannot correlate swapchain $index to ReShade"
+                }
+                $ids += $Matches[1]
+            }
+            if ($ids[0] -eq $ids[1]) { throw "$($case.Name): ReShade swapchain identifiers overlap" }
+            $epochRecords = @{}
+            foreach ($index in 0..1) {
+                $id = $ids[$index]
+                $starts = @($addon | Where-Object { $_ -match "event=swapchain_buffer_epoch action=begin swapchain=$id\b" })
+                $ends = @($addon | Where-Object { $_ -match "event=swapchain_buffer_epoch action=end swapchain=$id\b" })
+                $expected = if ($index -eq 0) { 2 } else { 1 }
+                if ($starts.Count -ne $expected -or $ends.Count -ne $expected -or
+                    @($addon | Where-Object { $_ -match "event=destroy_swapchain swapchain=$id resize=0\b" }).Count -ne 1) {
+                    throw "$($case.Name): incomplete epoch lifecycle for test swapchain $index"
+                }
+                if ($index -eq 0 -and
+                    (@($starts | Where-Object { $_ -match '\bresize=0\b.*\bsize=64x64\b' }).Count -ne 1 -or
+                     @($starts | Where-Object { $_ -match '\bresize=1\b.*\bsize=96x64\b' }).Count -ne 1 -or
+                     @($ends | Where-Object { $_ -match '\bresize=1\b' }).Count -ne 1)) {
+                    throw "$($case.Name): first swapchain resize epochs incorrect"
+                }
+                if ($index -eq 1 -and ($starts[0] -notmatch '\bsize=64x64\b' -or
+                    @($ends | Where-Object { $_ -match '\bresize=1\b' }).Count -ne 0)) {
+                    throw "$($case.Name): second swapchain unexpectedly resized"
+                }
+                foreach ($line in $starts) {
+                    if ($line -notmatch '\bepoch=(\d+)\b.*\bqpc_valid=1 qpc=(\d+)\b') {
+                        throw "$($case.Name): missing epoch ID or QPC"
+                    }
+                    $epochId = $Matches[1]; $startQpc = [long]$Matches[2]
+                    $matchingEnd = @($ends | Where-Object { $_ -match "\bepoch=$epochId\b" })
+                    if ($matchingEnd.Count -ne 1 -or
+                        $matchingEnd[0] -notmatch '\bqpc_valid=1 qpc=(\d+)\b') {
+                        throw "$($case.Name): missing end for epoch $epochId"
+                    }
+                    $endQpc = [long]$Matches[1]
+                    if ($startQpc -le 0 -or $endQpc -lt $startQpc) {
+                        throw "$($case.Name): invalid epoch timing $epochId"
+                    }
+                    $epochRecords[$epochId] = @{ Index = $index; Begin = $startQpc; End = $endQpc; Line = $line }
+                }
+            }
+            $before = @($epochRecords.Values | Where-Object { $_.Index -eq 0 -and $_.Line -match '\bsize=64x64\b' })
+            $after = @($epochRecords.Values | Where-Object { $_.Index -eq 0 -and $_.Line -match '\bsize=96x64\b' })
+            $other = @($epochRecords.Values | Where-Object { $_.Index -eq 1 })
+            if ($before.Count -ne 1 -or $after.Count -ne 1 -or $other.Count -ne 1 -or
+                $other[0].Begin -ge $before[0].End -or $other[0].End -le $after[0].Begin -or
+                $before[0].End -gt $after[0].Begin) {
+                throw "$($case.Name): second swapchain did not span the first swapchain resize"
+            }
+            Write-Output "MULTISWAP created=2 reshade_init_callbacks=$($initChains.Count)"
         }
         if ($case.Name -eq 'gpu-pipeline') {
             $submissions = @($trace | Where-Object { $_ -match 'event=gpu_pipeline_submit\b' })
@@ -396,6 +476,24 @@ try {
                     throw "$($case.Name): invalid query ordering for frame $expectedFrame"
                 }
             }
+            $immediate = @($trace | Where-Object { $_ -match 'event=gpu_pipeline_immediate submitted_frame=\d+ status=(not_ready|complete)\b' })
+            $summary = @($trace | Where-Object { $_ -match 'event=gpu_pipeline_immediate_summary not_ready=(\d+) complete=(\d+) unretired_before_first_drain=(\d+)' })
+            if ($immediate.Count -ne 8 -or $summary.Count -ne 1 -or
+                $summary[0] -notmatch 'not_ready=(\d+) complete=(\d+) unretired_before_first_drain=(\d+)' -or
+                ([int]$Matches[1] + [int]$Matches[2]) -ne 8 -or [int]$Matches[3] -ne 2) {
+                throw "$($case.Name): invalid immediate GPU query observations"
+            }
+            $notReadyCount = [int]$Matches[1]; $completeCount = [int]$Matches[2]
+            if (@($immediate | Where-Object { $_ -match '\bstatus=not_ready\b' }).Count -ne $notReadyCount -or
+                @($immediate | Where-Object { $_ -match '\bstatus=complete\b' }).Count -ne $completeCount) {
+                throw "$($case.Name): GPU query summary does not match individual observations"
+            }
+            foreach ($frame in 120..127) {
+                if (@($immediate | Where-Object { $_ -match "submitted_frame=$frame\b" }).Count -ne 1) {
+                    throw "$($case.Name): missing immediate observation for frame $frame"
+                }
+            }
+            Write-Output "GPU_IMMEDIATE $($summary[0])"
             Write-Output "GPU_PIPELINE submitted=8 completed=8 minimum_outstanding=3"
         }
         $evaluations = @($trace | Where-Object { $_ -match '\bevent=(taa_inputs|ngx_dx11_evaluate_inputs)\b' })

@@ -35,6 +35,7 @@ namespace temporal_diagnostics
                           nvrhi::ITexture* feedback1, nvrhi::ITexture* feedback2);
     void verify_taa_gpu_completion(nvrhi::IDevice* device);
     void verify_taa_gpu_pipeline(nvrhi::IDevice* device);
+    void verify_multiple_swapchains(nvrhi::IDevice* device);
     void log_dlss_inputs(ID3D11DeviceContext* context, ID3D11Resource* color, ID3D11Resource* output, ID3D11Resource* depth,
                          ID3D11Resource* motion, ID3D11Resource* exposure, unsigned width, unsigned height,
                          unsigned offsetX, unsigned offsetY, float jitterX, float jitterY,

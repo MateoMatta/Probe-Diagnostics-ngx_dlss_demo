@@ -4,6 +4,7 @@
 #if USE_DX11
 #include <Windows.h>
 #include <d3d11.h>
+#include <dxgi.h>
 #include <donut/core/log.h>
 #include <donut/engine/View.h>
 #include <nvrhi/d3d11/d3d11.h>
@@ -609,6 +610,7 @@ void verify_taa_gpu_pipeline(nvrhi::IDevice* device)
     struct PendingQuery { ComPtr<ID3D11Query> query; uint64_t frame; };
     static std::vector<PendingQuery> pending;
     static unsigned submitted = 0, completed = 0, maxOutstanding = 0;
+    static unsigned pendingPolls = 0, completePolls = 0, unretired = 0;
     static bool failed = false;
     if (failed)
         return;
@@ -639,9 +641,28 @@ void verify_taa_gpu_pipeline(nvrhi::IDevice* device)
         maxOutstanding = (std::max)(maxOutstanding, static_cast<unsigned>(pending.size()));
         log.write("event=gpu_pipeline_submit submitted_frame=%llu outstanding=%u",
                   static_cast<unsigned long long>(item.frame), static_cast<unsigned>(pending.size()));
+        BOOL immediateComplete = FALSE;
+        const HRESULT immediateHr = context->GetData(item.query.Get(), &immediateComplete, sizeof(immediateComplete),
+                                                      D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        if (immediateHr == S_FALSE)
+            ++pendingPolls;
+        else if (immediateHr == S_OK && immediateComplete)
+            ++completePolls;
+        else
+        {
+            log.write("event=gpu_sync_error stage=pipeline_immediate_poll hr=0x%08X complete=%u",
+                      static_cast<unsigned>(immediateHr), immediateComplete ? 1u : 0u);
+            failed = true;
+            return;
+        }
+        log.write("event=gpu_pipeline_immediate submitted_frame=%llu status=%s",
+                  static_cast<unsigned long long>(item.frame), immediateHr == S_FALSE ? "not_ready" : "complete");
     }
     if (log.frame < 122)
+    {
+        unretired = static_cast<unsigned>(pending.size());
         return;
+    }
     if (log.frame == 128)
         context->Flush();
     const ULONGLONG start = GetTickCount64();
@@ -681,7 +702,107 @@ void verify_taa_gpu_pipeline(nvrhi::IDevice* device)
         else
             log.write("event=gpu_pipeline_result submitted=%u completed=%u max_outstanding=%u",
                       submitted, completed, maxOutstanding);
+        if (pending.empty())
+            log.write("event=gpu_pipeline_immediate_summary not_ready=%u complete=%u unretired_before_first_drain=%u",
+                      pendingPolls, completePolls, unretired);
     }
+}
+
+void verify_multiple_swapchains(nvrhi::IDevice* device)
+{
+    auto& log = logger();
+    if (log.frame != 120)
+        return;
+    wchar_t setting[8] {};
+    const DWORD size = GetEnvironmentVariableW(L"OPTISCALER_DEMO_MULTISWAP_TEST", setting, 8);
+    if (size == 0 && GetLastError() == ERROR_ENVVAR_NOT_FOUND)
+        return;
+    if (size != 1 || setting[0] != L'1')
+    {
+        log.write("event=multiswap_error stage=config");
+        return;
+    }
+
+    struct TestWindows
+    {
+        HWND windows[2] {};
+        ~TestWindows() { for (HWND window : windows) if (window) DestroyWindow(window); }
+    } windows;
+    ID3D11DeviceContext* context = device->getNativeObject(nvrhi::ObjectTypes::D3D11_DeviceContext);
+    if (!context || context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE)
+    {
+        log.write("event=multiswap_error stage=context");
+        return;
+    }
+    ComPtr<ID3D11Device> nativeDevice;
+    context->GetDevice(&nativeDevice);
+    ComPtr<IDXGIFactory1> factory;
+    HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+    if (FAILED(hr))
+    {
+        log.write("event=multiswap_error stage=factory hr=0x%08X", static_cast<unsigned>(hr));
+        return;
+    }
+    ComPtr<IDXGISwapChain> chains[2];
+    for (unsigned i = 0; i < 2; ++i)
+    {
+        windows.windows[i] = CreateWindowExW(0, L"STATIC", L"OptiScaler diagnostic swapchain",
+                                             WS_OVERLAPPEDWINDOW, 0, 0, 64, 64, nullptr, nullptr,
+                                             GetModuleHandleW(nullptr), nullptr);
+        if (!windows.windows[i])
+        {
+            log.write("event=multiswap_error stage=window index=%u error=%lu", i, GetLastError());
+            return;
+        }
+        DXGI_SWAP_CHAIN_DESC desc {};
+        desc.BufferDesc.Width = 64;
+        desc.BufferDesc.Height = 64;
+        desc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        desc.BufferCount = 1;
+        desc.OutputWindow = windows.windows[i];
+        desc.Windowed = TRUE;
+        desc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+        hr = factory->CreateSwapChain(nativeDevice.Get(), &desc, &chains[i]);
+        if (FAILED(hr))
+        {
+            log.write("event=multiswap_error stage=create index=%u hr=0x%08X", i, static_cast<unsigned>(hr));
+            return;
+        }
+        log.write("event=multiswap_created index=%u chain=%p hwnd=%p", i,
+                  static_cast<void*>(chains[i].Get()), static_cast<void*>(windows.windows[i]));
+    }
+    if (chains[0].Get() == chains[1].Get())
+    {
+        log.write("event=multiswap_error stage=duplicate_chain");
+        return;
+    }
+    hr = chains[0]->ResizeBuffers(1, 96, 64, DXGI_FORMAT_R8G8B8A8_UNORM, 0);
+    if (FAILED(hr))
+    {
+        log.write("event=multiswap_error stage=resize hr=0x%08X", static_cast<unsigned>(hr));
+        return;
+    }
+    DXGI_SWAP_CHAIN_DESC desc[2] {};
+    for (unsigned i = 0; i < 2; ++i)
+    {
+        hr = chains[i]->GetDesc(&desc[i]);
+        if (FAILED(hr))
+        {
+            log.write("event=multiswap_error stage=description index=%u hr=0x%08X", i, static_cast<unsigned>(hr));
+            return;
+        }
+    }
+    if (desc[0].BufferDesc.Width != 96 || desc[0].BufferDesc.Height != 64 ||
+        desc[1].BufferDesc.Width != 64 || desc[1].BufferDesc.Height != 64)
+    {
+        log.write("event=multiswap_error stage=dimensions first=%ux%u second=%ux%u",
+                  desc[0].BufferDesc.Width, desc[0].BufferDesc.Height,
+                  desc[1].BufferDesc.Width, desc[1].BufferDesc.Height);
+        return;
+    }
+    log.write("event=multiswap_result status=pass chains=2 first=96x64 second=64x64");
 }
 
 void capture_temporal(nvrhi::IDevice* device, nvrhi::ITexture* depth, nvrhi::ITexture* motion,

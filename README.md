@@ -87,7 +87,7 @@ $demo = (Get-Location).Path
 
 Run this example from the repository root. The output path must not already exist; choose a new path for each run. The executable directory must also contain the ReShade `dxgi.dll`, the diagnostic `OptiScaler.addon64`, and `OptiScaler.ini`. The harness enables `TemporalInputs` tracing for every case and restores its process environment afterward. You can also pass `ngx_dlss_demo.exe` to `-Executable`.
 
-The default suite covers 15 DX11 scenarios, including resolution changes with TemporalAA and DLSS, resource-generation correlation, and multiple outstanding GPU event queries. The probe records separate swapchain-buffer observation epochs between ReShade swapchain callbacks and correlates them with sampled bindings and the three resize stages. These epochs are not actual resource creation/destruction times or GPU synchronization. Resource observations without an observed creation event remain **unknown** and are not assigned an inferred resource generation. The tests do not establish complete lifetime coverage, synchronization across processes, a universal per-pixel scene identity, or a functioning OptiScaler backend.
+The default suite covers 16 DX11 scenarios, including resolution changes with TemporalAA and DLSS, two additional real swapchains on the same device, resource-generation correlation, and multiple outstanding GPU event queries. The probe records separate swapchain-buffer observation epochs between ReShade swapchain callbacks and correlates them with sampled bindings and the three resize stages. These epochs are not actual resource creation/destruction times or GPU synchronization. Resource observations without an observed creation event remain **unknown** and are not assigned an inferred resource generation. The tests do not establish complete lifetime coverage, synchronization across processes, a universal per-pixel scene identity, or a functioning OptiScaler backend.
 
 ### Key Diagnostic Flags & Modes:
 
@@ -105,7 +105,9 @@ The default suite covers 15 DX11 scenarios, including resolution changes with Te
 
 ### Targeted Harness Options:
 
-You can run individual test cases in isolation using flags like `-ShaderBindingsOnly`, `-OverlapOnly`, `-IdentityOnly`, `-DxgiAdapterOnly`, `-ResizeOnly`, `-ResizeDlssOnly`, `-GpuPipelineOnly`, or `-CameraOnly`.
+You can run individual test cases in isolation using flags like `-ShaderBindingsOnly`, `-OverlapOnly`, `-IdentityOnly`, `-DxgiAdapterOnly`, `-ResizeOnly`, `-ResizeDlssOnly`, `-GpuPipelineOnly`, `-MultiSwapOnly`, or `-CameraOnly`. The multi-swapchain test creates two hidden swapchains on the demo device, resizes one while the other remains live, and checks their observed epochs separately. It does not present them or validate multiple devices.
+
+The GPU pipeline test polls each event query immediately with `D3D11_ASYNC_GETDATA_DONOTFLUSH` and records `not_ready` or `complete`, separately from the count of unretired queries. `not_ready` means the result was not available at that poll; it does not prove that the GPU has started executing it or that frames overlap on the GPU. The final bounded drain flushes and checks completion.
 
 ## Linux Support
 
