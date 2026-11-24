@@ -4,6 +4,15 @@ bin/ngx_dlss_demo/*.log
 bin/ngx_dlss_demo/TemporalInputs_*.log
 bin/ngx_dlss_demo/OptiScaler-ReShade_*.log
 bin/ngx_dlss_demo/ReShade.log
+bin/ngx_dlss_demo/Licenses
+bin/ngx_dlss_demo/OptiScaler
+bin/ngx_dlss_demo/reshade-shaders
+bin/ngx_dlss_demo/dxgi.dll
+bin/ngx_dlss_demo/OptiScaler.addon64
+bin/ngx_dlss_demo/OptiScaler.ini
+bin/ngx_dlss_demo/ReShade.ini
+bin/ngx_dlss_demo/ReShadePreset.ini
+
 
 # Build outputs & intermediate directories
 out/
