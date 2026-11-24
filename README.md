@@ -78,13 +78,16 @@ This repository includes a PowerShell automation harness: `dx11-diagnostic-harne
 ### Harness Execution Example:
 
 ```powershell
+$demo = (Get-Location).Path
 .\dx11-diagnostic-harness.ps1 `
-    -Executable "D:\Descargas\Proyecto compatiblidad DirectX - Vulkan Optiscaler\Extra\DLSS-Probe-Diagnostics-ngx_dlss_demo\bin\ngx_dlss_demo\ngx_dlss_demo_diagnostics.exe" `
-    -MediaPath "D:\Descargas\Proyecto compatiblidad DirectX - Vulkan Optiscaler\Extra\DLSS-Probe-Diagnostics-ngx_dlss_demo\media" `
-    -OutputPath "D:\Descargas\Proyecto compatiblidad DirectX - Vulkan Optiscaler\Extra\DLSS-Probe-Diagnostics-ngx_dlss_demo\diagnostic-results"
+    -Executable (Join-Path $demo 'bin\ngx_dlss_demo\ngx_dlss_demo_diagnostics.exe') `
+    -MediaPath (Join-Path $demo 'media') `
+    -OutputPath (Join-Path $demo 'diagnostic-results\run-001')
 ```
 
-*(You can also pass `ngx_dlss_demo.exe` to `-Executable` if desired).*
+Run this example from the repository root. The output path must not already exist; choose a new path for each run. The executable directory must also contain the ReShade `dxgi.dll`, the diagnostic `OptiScaler.addon64`, and `OptiScaler.ini`. The harness enables `TemporalInputs` tracing for every case and restores its process environment afterward. You can also pass `ngx_dlss_demo.exe` to `-Executable`.
+
+The default suite covers 15 DX11 scenarios, including resolution changes with TemporalAA and DLSS, resource-generation correlation, and multiple outstanding GPU event queries. The probe records separate swapchain-buffer observation epochs between ReShade swapchain callbacks and correlates them with sampled bindings and the three resize stages. These epochs are not actual resource creation/destruction times or GPU synchronization. Resource observations without an observed creation event remain **unknown** and are not assigned an inferred resource generation. The tests do not establish complete lifetime coverage, synchronization across processes, a universal per-pixel scene identity, or a functioning OptiScaler backend.
 
 ### Key Diagnostic Flags & Modes:
 
@@ -98,7 +101,7 @@ This repository includes a PowerShell automation harness: `dx11-diagnostic-harne
 
 * **`-diagnostic-resize`**: Triggers runtime resolution changes (e.g., `640x360` $\rightarrow$ `800x450` $\rightarrow$ `640x360`) to test resource creation/destruction QPCs.
 
-* **`-stress-fps`**: Unlocks/increases the internal frame-pacing target to 300 FPS for stress testing.
+* **`-stress-fps`**: Raises the internal frame-pacing limit from 240 to 300 FPS for stress testing. Pass `-StressFps` to the harness to test that mode.
 
 ### Targeted Harness Options:
 

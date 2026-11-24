@@ -175,7 +175,57 @@ try {
             $destroys = 0
             $observed = 0
             $unknown = 0
+            $epochs = @{}
+            $seenEpochs = @{}
+            $epochHistory = @{}
+            $epochBegins = 0
+            $epochEnds = 0
+            $epochObservations = 0
             foreach ($line in $addon) {
+                if ($line -match 'event=swapchain_buffer_epoch_error\b') {
+                    throw "$($case.Name): swapchain buffer epoch error: $line"
+                }
+                if ($line -match 'event=swapchain_buffer_epoch action=(begin|end) swapchain=([0-9A-Fa-f]+) device=([0-9A-Fa-f]+) index=(\d+) resource=0x([0-9A-Fa-f]+) epoch=(\d+) resize=[01] qpc_valid=1 qpc=(\d+)') {
+                    $action = $Matches[1]; $chain = $Matches[2]; $device = $Matches[3]
+                    $index = $Matches[4]; $resource = $Matches[5]; $epoch = $Matches[6]
+                    $qpc = [long]$Matches[7]
+                    $key = "${chain}:${index}"
+                    if ($qpc -le 0 -or $epoch -eq '0') { throw "$($case.Name): invalid swapchain epoch: $line" }
+                    if ($action -eq 'begin') {
+                        if ($epochs.ContainsKey($key) -or $seenEpochs.ContainsKey($epoch)) {
+                            throw "$($case.Name): duplicate live or reused swapchain epoch: $line"
+                        }
+                        if ($line -notmatch '\bsize=(\d+x\d+)\b') {
+                            throw "$($case.Name): missing swapchain buffer size: $line"
+                        }
+                        $epochs[$key] = @{ Chain = $chain; Index = $index; Device = $device; Resource = $resource; Epoch = $epoch; Qpc = $qpc; Size = $Matches[1]; End = $null }
+                        $epochHistory[$epoch] = $epochs[$key]
+                        $seenEpochs[$epoch] = $true
+                        ++$epochBegins
+                    } else {
+                        if (-not $epochs.ContainsKey($key) -or $epochs[$key].Epoch -ne $epoch -or
+                            $epochs[$key].Device -ne $device -or $epochs[$key].Resource -ne $resource -or
+                            $qpc -lt $epochs[$key].Qpc) {
+                            throw "$($case.Name): unmatched swapchain epoch end: $line"
+                        }
+                        $epochs[$key].End = $qpc
+                        $epochs.Remove($key)
+                        ++$epochEnds
+                    }
+                } elseif ($line -match 'event=swapchain_buffer_epoch\b') {
+                    throw "$($case.Name): malformed swapchain epoch: $line"
+                }
+                if ($line -match 'event=swapchain_buffer_observe bind_sequence=\d+ device=([0-9A-Fa-f]+) resource=0x([0-9A-Fa-f]+) epoch=(\d+) status=(matched|ambiguous)') {
+                    $device = $Matches[1]; $resource = $Matches[2]; $epoch = $Matches[3]; $status = $Matches[4]
+                    $matchingEpochs = @($epochs.Values | Where-Object { $_.Device -eq $device -and $_.Resource -eq $resource })
+                    if (($status -eq 'matched' -and ($matchingEpochs.Count -ne 1 -or $matchingEpochs[0].Epoch -ne $epoch)) -or
+                        ($status -eq 'ambiguous' -and ($matchingEpochs.Count -lt 2 -or $epoch -ne '0'))) {
+                        throw "$($case.Name): invalid swapchain buffer observation: $line"
+                    }
+                    ++$epochObservations
+                } elseif ($line -match 'event=swapchain_buffer_observe\b') {
+                    throw "$($case.Name): malformed swapchain observation: $line"
+                }
                 if ($line -match 'event=resource_lifetime action=(create|destroy|observe) sequence=(\d+) (?:bind_sequence=\d+ )?device=([0-9A-Fa-f]+) resource=0x([0-9A-Fa-f]+) generation=(\d+)') {
                     $action = $Matches[1]; $sequence = [long]$Matches[2]
                     $key = "$($Matches[3]):$($Matches[4])"; $generation = $Matches[5]
@@ -186,7 +236,9 @@ try {
                             throw "$($case.Name): duplicate live resource or generation"
                         }
                         $live[$key] = $generation; $seenGenerations[$generation] = $true; ++$creates
-                        if ($line -notmatch '\bqpc_valid=1 qpc=(\d+)\b') { throw "$($case.Name): missing creation QPC" }
+                        if ($line -notmatch '\bqpc_valid=1 qpc=(\d+)\b' -or [long]$Matches[1] -le 0) {
+                            throw "$($case.Name): missing or invalid creation QPC"
+                        }
                         $lifetimesByGeneration[$generation] = @{
                             Resource = $key.Split(':')[1].TrimStart('0').ToUpperInvariant()
                             Created = [long]$Matches[1]; Destroyed = $null
@@ -195,7 +247,11 @@ try {
                         if (-not $live.ContainsKey($key) -or $live[$key] -ne $generation) {
                             throw "$($case.Name): destruction does not match live generation"
                         }
-                        if ($line -notmatch '\bqpc_valid=1 qpc=(\d+)\b') { throw "$($case.Name): missing destruction QPC" }
+                        if ($line -notmatch '\bqpc_valid=1 qpc=(\d+)\b' -or
+                            [long]$Matches[1] -le 0 -or
+                            [long]$Matches[1] -lt $lifetimesByGeneration[$generation].Created) {
+                            throw "$($case.Name): missing, invalid or out-of-order destruction QPC"
+                        }
                         $lifetimesByGeneration[$generation].Destroyed = [long]$Matches[1]
                         $live.Remove($key); ++$destroys
                     } elseif ($generation -eq '0') {
@@ -218,6 +274,9 @@ try {
                 $_ -match 'event=resource_lifetime_device_end\b.*\bremaining=0\b'
             }).Count) {
                 throw "$($case.Name): tracked resources did not close cleanly with the device"
+            }
+            if ($epochs.Count -ne 0 -or $epochBegins -lt 3 -or $epochBegins -ne $epochEnds) {
+                throw "$($case.Name): incomplete swapchain buffer epochs: begin=$epochBegins end=$epochEnds live=$($epochs.Count)"
             }
             foreach ($step in @(1, 2)) {
                 if (@($trace | Where-Object { $_ -match "event=resize_request step=$step\b" }).Count -ne 1) {
@@ -255,6 +314,8 @@ try {
                 }
             }
             $previousGenerations = @{}
+            $resizeEpochs = @{}
+            $resizeBuffer = $null
             $event = if ($mode -eq 'DLSS') { 'ngx_dx11_evaluate_inputs' } else { 'taa_inputs' }
             $roles = if ($mode -eq 'DLSS') { @('color', 'output', 'motion', 'depth') } else {
                 @('resolve_color', 'output', 'motion', 'motion_pass_depth', 'feedback1', 'feedback2')
@@ -262,6 +323,26 @@ try {
             foreach ($frameLine in @($small[0], $large[0], $smallAfter[0])) {
                 if ($frameLine -notmatch '\bframe=(\d+)' ) { throw "$($case.Name): missing frame ID" }
                 $frameId = $Matches[1]
+                if ($frameLine -notmatch '\bqpc=(\d+).*?\bdisplay=(\d+x\d+)\b') {
+                    throw "$($case.Name): missing frame timestamp or display dimensions"
+                }
+                $frameQpc = [long]$Matches[1]; $displaySize = $Matches[2]
+                $frameEpochs = @($epochHistory.Values | Where-Object {
+                    $_.Size -eq $displaySize -and $_.Qpc -le $frameQpc -and
+                        $null -ne $_.End -and $frameQpc -lt $_.End
+                })
+                if ($frameEpochs.Count -ne 1) {
+                    throw "$($case.Name): frame $frameId has $($frameEpochs.Count) matching swapchain buffer epochs"
+                }
+                $bufferKey = "$($frameEpochs[0].Chain):$($frameEpochs[0].Index)"
+                if ($null -ne $resizeBuffer -and $resizeBuffer -ne $bufferKey) {
+                    throw "$($case.Name): resize frames resolved to different swapchain buffer slots"
+                }
+                if ($resizeEpochs.ContainsKey($frameEpochs[0].Epoch)) {
+                    throw "$($case.Name): resize frames reused a swapchain epoch"
+                }
+                $resizeBuffer = $bufferKey
+                $resizeEpochs[$frameEpochs[0].Epoch] = $true
                 $inputs = @($trace | Where-Object { $_ -match "\bframe=$frameId event=$event\b" })
                 if ($inputs.Count -ne 1 -or $inputs[0] -notmatch '\bqpc=(\d+)') {
                     throw "$($case.Name): missing temporal input timestamp at frame $frameId"
@@ -286,7 +367,8 @@ try {
                 }
             }
             Write-Output "RESOURCE_LIFETIMES create=$creates destroy=$destroys live_observations=$observed unknown_observations=$unknown"
-            Write-Output "RESOURCE_CORRELATION three_resolutions=1 roles=$($roles.Count) mode=$mode history_recovery=next_frame"
+            Write-Output "SWAPCHAIN_EPOCHS begin=$epochBegins end=$epochEnds observations=$epochObservations"
+            Write-Output "RESOURCE_CORRELATION three_sizes=1 swapchain_epochs=1 roles=$($roles.Count) mode=$mode history_recovery=next_frame"
         }
         if ($case.Name -ne 'shader-bindings' -and
             -not @($addon | Where-Object { $_ -match 'event=logger_shutdown dropped=0 file_write_failed=0 .*truncated=0' }).Count) {
